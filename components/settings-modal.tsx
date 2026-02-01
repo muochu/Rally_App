@@ -8,6 +8,9 @@ import {
   Alert,
   Linking,
   ScrollView,
+  TextInput,
+  Switch,
+  ActivityIndicator,
 } from 'react-native';
 import { useAuth } from '@/hooks/use-auth';
 import { useColorScheme } from '@/hooks/use-color-scheme';
@@ -24,10 +27,25 @@ export function SettingsModal({ visible, onClose }: Props) {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
   const isDark = colorScheme === 'dark';
-  const { user, signOut, googleCalendarConnected, disconnectGoogleCalendar } = useAuth();
+  const { user, profile, signOut, updateProfile, googleCalendarConnected, disconnectGoogleCalendar } = useAuth();
   const [appleCalendarConnected, setAppleCalendarConnected] = useState(false);
   const [googleLastSync, setGoogleLastSync] = useState<string | null>(null);
   const [appleLastSync, setAppleLastSync] = useState<string | null>(null);
+
+  // Profile editing state
+  const [editingProfile, setEditingProfile] = useState(false);
+  const [displayName, setDisplayName] = useState('');
+  const [discoverable, setDiscoverable] = useState(false);
+  const [savingProfile, setSavingProfile] = useState(false);
+
+  // Sync profile editing state when modal opens or profile changes
+  useEffect(() => {
+    if (visible && profile) {
+      setDisplayName(profile.display_name || '');
+      setDiscoverable(profile.discoverable);
+      setEditingProfile(false);
+    }
+  }, [visible, profile]);
 
   useEffect(() => {
     if (visible && user?.id) {
@@ -149,6 +167,30 @@ export function SettingsModal({ visible, onClose }: Props) {
     );
   };
 
+  const handleSaveProfile = async () => {
+    const trimmedName = displayName.trim();
+    if (trimmedName.length < 2 || trimmedName.length > 40) {
+      Alert.alert('Invalid Name', 'Display name must be 2-40 characters.');
+      return;
+    }
+
+    setSavingProfile(true);
+    try {
+      await updateProfile({ display_name: trimmedName, discoverable });
+      setEditingProfile(false);
+    } catch (e: any) {
+      Alert.alert('Error', e?.message || 'Failed to save profile');
+    } finally {
+      setSavingProfile(false);
+    }
+  };
+
+  const handleCancelEdit = () => {
+    setDisplayName(profile?.display_name || '');
+    setDiscoverable(profile?.discoverable || false);
+    setEditingProfile(false);
+  };
+
   return (
     <Modal visible={visible} animationType="slide" presentationStyle="pageSheet">
       <View style={[styles.container, { backgroundColor: colors.background }]}>
@@ -160,6 +202,82 @@ export function SettingsModal({ visible, onClose }: Props) {
         </View>
 
         <ScrollView style={styles.content} showsVerticalScrollIndicator={false}>
+          {/* Profile Section */}
+          <Text style={[styles.sectionTitle, { color: colors.icon }]}>PROFILE</Text>
+          <View style={[styles.card, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+            {/* Display Name */}
+            <View style={styles.row}>
+              <Text style={[styles.label, { color: colors.text }]}>Display Name</Text>
+              {editingProfile ? (
+                <TextInput
+                  style={[styles.editInput, { color: colors.text, borderColor: isDark ? '#444' : '#ddd' }]}
+                  value={displayName}
+                  onChangeText={setDisplayName}
+                  placeholder="Your name"
+                  placeholderTextColor={colors.icon}
+                  maxLength={40}
+                  autoCapitalize="words"
+                />
+              ) : (
+                <Text style={[styles.valueSmall, { color: colors.icon }]}>
+                  {profile?.display_name || 'Not set'}
+                </Text>
+              )}
+            </View>
+
+            <View style={[styles.divider, { backgroundColor: isDark ? '#333' : '#eee' }]} />
+
+            {/* Discoverable Toggle */}
+            <View style={styles.row}>
+              <View style={styles.toggleLabelContainer}>
+                <Text style={[styles.label, { color: colors.text }]}>Discoverable</Text>
+                <Text style={[styles.toggleHint, { color: colors.icon }]}>
+                  Let others find you by name
+                </Text>
+              </View>
+              {editingProfile ? (
+                <Switch
+                  value={discoverable}
+                  onValueChange={setDiscoverable}
+                  trackColor={{ false: isDark ? '#333' : '#ddd', true: colors.tint }}
+                  thumbColor="#fff"
+                />
+              ) : (
+                <Text style={[styles.valueSmall, { color: profile?.discoverable ? '#4caf50' : colors.icon }]}>
+                  {profile?.discoverable ? 'On' : 'Off'}
+                </Text>
+              )}
+            </View>
+
+            <View style={[styles.divider, { backgroundColor: isDark ? '#333' : '#eee' }]} />
+
+            {/* Edit / Save / Cancel */}
+            <View style={styles.row}>
+              {editingProfile ? (
+                <View style={styles.editActions}>
+                  <TouchableOpacity
+                    style={[styles.saveBtn, { backgroundColor: colors.tint }]}
+                    onPress={handleSaveProfile}
+                    disabled={savingProfile}
+                  >
+                    {savingProfile ? (
+                      <ActivityIndicator size="small" color="#fff" />
+                    ) : (
+                      <Text style={styles.saveBtnText}>Save</Text>
+                    )}
+                  </TouchableOpacity>
+                  <TouchableOpacity style={styles.cancelBtn} onPress={handleCancelEdit}>
+                    <Text style={[styles.cancelBtnText, { color: colors.icon }]}>Cancel</Text>
+                  </TouchableOpacity>
+                </View>
+              ) : (
+                <TouchableOpacity onPress={() => setEditingProfile(true)}>
+                  <Text style={[styles.editText, { color: colors.tint }]}>Edit Profile</Text>
+                </TouchableOpacity>
+              )}
+            </View>
+          </View>
+
           {/* Account Section */}
           <Text style={[styles.sectionTitle, { color: colors.icon }]}>ACCOUNT</Text>
           <View style={[styles.card, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
@@ -313,4 +431,51 @@ const styles = StyleSheet.create({
   },
   signOutText: { color: '#e53935', fontSize: 16, fontWeight: '600' },
   version: { textAlign: 'center', fontSize: 12, marginTop: 24, marginBottom: 40 },
+
+  // Profile editing styles
+  editInput: {
+    flex: 1,
+    fontSize: 14,
+    paddingVertical: 6,
+    paddingHorizontal: 10,
+    borderWidth: 1,
+    borderRadius: 8,
+    marginLeft: 12,
+    textAlign: 'right',
+  },
+  toggleLabelContainer: {
+    flex: 1,
+  },
+  toggleHint: {
+    fontSize: 12,
+    marginTop: 2,
+  },
+  editActions: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    flex: 1,
+  },
+  saveBtn: {
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+    borderRadius: 8,
+  },
+  saveBtnText: {
+    color: '#fff',
+    fontSize: 14,
+    fontWeight: '600',
+  },
+  cancelBtn: {
+    paddingHorizontal: 12,
+    paddingVertical: 8,
+  },
+  cancelBtnText: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
+  editText: {
+    fontSize: 14,
+    fontWeight: '500',
+  },
 });

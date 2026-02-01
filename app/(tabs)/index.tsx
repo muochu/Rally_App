@@ -7,6 +7,7 @@ import {
   ScrollView,
   Alert,
   ActivityIndicator,
+  Animated,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect } from '@react-navigation/native';
@@ -29,6 +30,12 @@ import type { AvailabilityWindow } from '@/lib/types';
 type WhenOption = 'later' | 'weekdays' | 'weekends';
 type TimeOfDay = 'morning' | 'noon' | 'afternoon' | 'evening';
 
+type SyncFeedback = {
+  type: 'success' | 'error';
+  message: string;
+  source: 'google' | 'apple';
+} | null;
+
 const TIME_RANGES: Record<TimeOfDay, { start: number; end: number; label: string }> = {
   morning: { start: 6, end: 10, label: 'Morning (6a-10a)' },
   noon: { start: 10, end: 13, label: 'Noon (10a-1p)' },
@@ -36,30 +43,22 @@ const TIME_RANGES: Record<TimeOfDay, { start: number; end: number; label: string
   evening: { start: 17, end: 21, label: 'Evening (5p-9p)' },
 };
 
-// Get available time options based on current time
 const getAvailableTimeOptions = (when: WhenOption): TimeOfDay[] => {
   if (when !== 'later') {
-    // For weekdays/weekends, all options available
     return ['morning', 'noon', 'afternoon', 'evening'];
   }
-
   const now = new Date();
   const currentHour = now.getHours();
   const available: TimeOfDay[] = [];
-
-  // Morning available if before 10am
   if (currentHour < 10) available.push('morning');
-  // Noon available if before 1pm
   if (currentHour < 13) available.push('noon');
-  // Afternoon available if before 5pm
   if (currentHour < 17) available.push('afternoon');
-  // Evening available if before 9pm
   if (currentHour < 21) available.push('evening');
-
   return available;
 };
 
 const REDIRECT_URL = 'rallyapp://auth/callback';
+const PREVIEW_SLOTS = 3;
 
 export default function HomeScreen() {
   const colorScheme = useColorScheme() ?? 'light';
@@ -70,7 +69,6 @@ export default function HomeScreen() {
     user,
     session,
     googleCalendarConnected,
-    googleCalendarEmail,
     refreshGoogleCalendarStatus,
   } = useAuth();
   const userId = user?.id;
@@ -88,10 +86,22 @@ export default function HomeScreen() {
   const [availability, setAvailability] = useState<AvailabilityWindow[]>([]);
   const [googleLastSync, setGoogleLastSync] = useState<string | null>(null);
   const [appleLastSync, setAppleLastSync] = useState<string | null>(null);
+  const [syncFeedback, setSyncFeedback] = useState<SyncFeedback>(null);
+  const [feedbackOpacity] = useState(new Animated.Value(0));
 
   useEffect(() => {
     checkAppleCalendar();
   }, []);
+
+  // Show feedback banner with auto-dismiss
+  const showFeedback = useCallback((feedback: SyncFeedback) => {
+    setSyncFeedback(feedback);
+    Animated.sequence([
+      Animated.timing(feedbackOpacity, { toValue: 1, duration: 200, useNativeDriver: true }),
+      Animated.delay(3000),
+      Animated.timing(feedbackOpacity, { toValue: 0, duration: 300, useNativeDriver: true }),
+    ]).start(() => setSyncFeedback(null));
+  }, [feedbackOpacity]);
 
   const loadAvailability = useCallback(async () => {
     if (!userId) return;
@@ -132,13 +142,8 @@ export default function HomeScreen() {
     return `${Math.floor(diff / 86400000)}d ago`;
   };
 
-  const syncAll = () => {
-    if (googleCalendarConnected) syncGoogleCalendar();
-    if (appleCalendarSynced) syncAppleCalendar();
-  };
-
   const syncGoogleCalendar = async () => {
-    if (!session?.access_token) return;
+    if (!session?.access_token || syncingGoogle) return;
     setSyncingGoogle(true);
     try {
       const res = await fetch(`${SUPABASE_URL}/functions/v1/google-calendar-sync`, {
@@ -153,17 +158,28 @@ export default function HomeScreen() {
       const data = await res.json();
       if (res.ok && data.synced !== undefined) {
         setGoogleLastSync(formatSyncTime(new Date()));
+        showFeedback({
+          type: 'success',
+          message: `Google Calendar synced${data.synced > 0 ? ` • ${data.synced} busy blocks` : ''}`,
+          source: 'google',
+        });
+      } else {
+        throw new Error(data.error || 'Sync failed');
       }
-    } catch (e) {
+    } catch (e: any) {
       console.warn('[Sync] Google failed:', e);
-      Alert.alert('Sync Failed', 'Could not sync Google Calendar.');
+      showFeedback({
+        type: 'error',
+        message: 'Google sync failed',
+        source: 'google',
+      });
     } finally {
       setSyncingGoogle(false);
     }
   };
 
   const syncAppleCalendar = async () => {
-    if (!userId) return;
+    if (!userId || syncingApple) return;
     setSyncingApple(true);
     try {
       let permission = await getCalendarPermissionStatus();
@@ -179,9 +195,18 @@ export default function HomeScreen() {
       await busyBlocksApi.upsertFromCalendar(userId, blocks);
       setAppleCalendarSynced(true);
       setAppleLastSync(formatSyncTime(new Date()));
+      showFeedback({
+        type: 'success',
+        message: `iCloud synced${blocks.length > 0 ? ` • ${blocks.length} busy blocks` : ''}`,
+        source: 'apple',
+      });
     } catch (e) {
       console.warn('[Sync] Apple failed:', e);
-      Alert.alert('Sync Failed', 'Could not sync iCloud Calendar.');
+      showFeedback({
+        type: 'error',
+        message: 'iCloud sync failed',
+        source: 'apple',
+      });
     } finally {
       setSyncingApple(false);
     }
@@ -231,7 +256,7 @@ export default function HomeScreen() {
       }
       if (added > 0) {
         Alert.alert('Scheduled!', `${added} new time slot${added !== 1 ? 's' : ''} added.`);
-        loadAvailability(); // Refresh the display
+        loadAvailability();
       } else {
         Alert.alert('No changes', 'All selected times were already in your availability.');
       }
@@ -312,11 +337,9 @@ export default function HomeScreen() {
     </TouchableOpacity>
   );
 
-  // Get available time options for current selection
   const hasLaterSelected = selectedWhen.includes('later');
   const availableTimeOptions = hasLaterSelected ? getAvailableTimeOptions('later') : ['morning', 'noon', 'afternoon', 'evening'] as TimeOfDay[];
 
-  // Auto-filter selected times if "later" is selected and some are no longer valid
   useEffect(() => {
     if (hasLaterSelected) {
       const validTimes = selectedTimes.filter((t) => availableTimeOptions.includes(t));
@@ -328,10 +351,47 @@ export default function HomeScreen() {
     }
   }, [hasLaterSelected, availableTimeOptions, selectedTimes]);
 
+  const formatSlot = (item: AvailabilityWindow) => {
+    const start = new Date(item.start_ts_utc);
+    const end = new Date(item.end_ts_utc);
+    const now = new Date();
+    const tomorrow = new Date(now);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    const isToday = start.toDateString() === now.toDateString();
+    const isTomorrow = start.toDateString() === tomorrow.toDateString();
+    const dateStr = isToday ? 'Today' : isTomorrow ? 'Tomorrow' : start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    const timeStr = `${start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+    return { dateStr, timeStr };
+  };
+
+  const anyCalendarConnected = googleCalendarConnected || appleCalendarSynced;
+
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
+      {/* Sync Feedback Banner */}
+      {syncFeedback && (
+        <Animated.View
+          style={[
+            styles.feedbackBanner,
+            { opacity: feedbackOpacity },
+            syncFeedback.type === 'success'
+              ? { backgroundColor: isDark ? '#1b4332' : '#d4edda' }
+              : { backgroundColor: isDark ? '#4a1515' : '#f8d7da' },
+          ]}
+        >
+          <Text
+            style={[
+              styles.feedbackText,
+              { color: syncFeedback.type === 'success' ? (isDark ? '#95d5b2' : '#155724') : (isDark ? '#f5a5a5' : '#721c24') },
+            ]}
+          >
+            {syncFeedback.message}
+          </Text>
+        </Animated.View>
+      )}
+
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        {/* Header with Profile */}
+        {/* Header */}
         <View style={styles.headerRow}>
           <View style={{ flex: 1 }} />
           <TouchableOpacity
@@ -348,180 +408,163 @@ export default function HomeScreen() {
             <Text style={[styles.logo, { color: colors.text }]}>RALLY</Text>
           </View>
 
-          {/* Collapsible Calendar Sync */}
+          {/* Schedule a Match - Primary Action */}
           <TouchableOpacity
-            style={styles.sectionHeader}
-            onPress={() => setShowCalendars(!showCalendars)}
+            style={[styles.primarySection, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+            onPress={() => setShowSchedule(!showSchedule)}
+            activeOpacity={0.7}
           >
-            <Text style={[styles.sectionTitle, { color: colors.icon }]}>Sync Calendars</Text>
-            <View style={styles.sectionRight}>
-              {(googleCalendarConnected || appleCalendarSynced) && (
-                <TouchableOpacity onPress={syncAll} style={styles.refreshBtn}>
-                  <Text style={[styles.refreshText, { color: colors.tint }]}>↻</Text>
-                </TouchableOpacity>
-              )}
-              <Text style={[styles.chevron, { color: colors.icon }]}>{showCalendars ? '▲' : '▼'}</Text>
+            <View style={styles.primaryHeader}>
+              <Text style={[styles.primaryTitle, { color: colors.text }]}>Schedule a Match</Text>
+              <Text style={[styles.chevron, { color: colors.icon }]}>{showSchedule ? '▲' : '▼'}</Text>
             </View>
           </TouchableOpacity>
 
-          {showCalendars && (
-            <View style={[styles.calendarList, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-              {/* Google Calendar Row */}
-              <TouchableOpacity
-                style={styles.calendarItem}
-                onPress={googleCalendarConnected ? syncGoogleCalendar : handleConnectGoogle}
-                disabled={syncingGoogle}
-              >
-                <View style={styles.calendarInfo}>
-                  <Text style={[styles.calendarName, { color: colors.text }]}>Google Calendar</Text>
-                  {googleCalendarConnected ? (
-                    <>
-                      <Text style={[styles.calendarEmail, { color: colors.icon }]}>
-                        {googleCalendarEmail || 'Connected'}
-                      </Text>
-                      {googleLastSync && (
-                        <Text style={[styles.syncTime, { color: colors.icon }]}>Synced {googleLastSync}</Text>
-                      )}
-                    </>
-                  ) : (
-                    <Text style={[styles.calendarEmail, { color: colors.icon }]}>Tap to connect</Text>
-                  )}
-                </View>
-                {syncingGoogle ? (
-                  <ActivityIndicator size="small" color="#4285F4" />
-                ) : googleCalendarConnected ? (
-                  <Text style={[styles.calendarStatus, { color: '#4caf50' }]}>✓</Text>
-                ) : (
-                  <Text style={[styles.calendarStatus, { color: colors.tint }]}>Connect</Text>
-                )}
-              </TouchableOpacity>
-
-              <View style={[styles.divider, { backgroundColor: isDark ? '#333' : '#eee' }]} />
-
-              {/* iCloud Calendar Row */}
-              <TouchableOpacity
-                style={styles.calendarItem}
-                onPress={syncAppleCalendar}
-                disabled={syncingApple}
-              >
-                <View style={styles.calendarInfo}>
-                  <Text style={[styles.calendarName, { color: colors.text }]}>iCloud Calendar</Text>
-                  {appleCalendarSynced ? (
-                    <>
-                      <Text style={[styles.calendarEmail, { color: colors.icon }]}>Device calendars</Text>
-                      {appleLastSync && (
-                        <Text style={[styles.syncTime, { color: colors.icon }]}>Synced {appleLastSync}</Text>
-                      )}
-                    </>
-                  ) : (
-                    <Text style={[styles.calendarEmail, { color: colors.icon }]}>Tap to connect</Text>
-                  )}
-                </View>
-                {syncingApple ? (
-                  <ActivityIndicator size="small" color="#007AFF" />
-                ) : appleCalendarSynced ? (
-                  <Text style={[styles.calendarStatus, { color: '#4caf50' }]}>✓</Text>
-                ) : (
-                  <Text style={[styles.calendarStatus, { color: colors.tint }]}>Connect</Text>
-                )}
-              </TouchableOpacity>
-            </View>
-          )}
-
-          {/* Schedule a match */}
-          <TouchableOpacity style={styles.sectionHeader} onPress={() => setShowSchedule(!showSchedule)}>
-            <Text style={[styles.sectionTitle, { color: colors.icon }]}>Schedule a match</Text>
-            <Text style={[styles.chevron, { color: colors.icon }]}>{showSchedule ? '▲' : '▼'}</Text>
-          </TouchableOpacity>
-
-          {/* Schedule Options */}
           {showSchedule && (
             <View style={[styles.scheduleCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-              <Text style={[styles.scheduleLabel, { color: colors.icon }]}>When (select multiple)</Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.pillRow}>
+              <Text style={[styles.scheduleLabel, { color: colors.icon }]}>When</Text>
+              <View style={styles.pillRow}>
                 <Pill label="Later today" selected={selectedWhen.includes('later')} onPress={() => toggleWhen('later')} />
                 <Pill label="Weekdays" selected={selectedWhen.includes('weekdays')} onPress={() => toggleWhen('weekdays')} />
                 <Pill label="Weekends" selected={selectedWhen.includes('weekends')} onPress={() => toggleWhen('weekends')} />
-              </ScrollView>
+              </View>
 
-              <Text style={[styles.scheduleLabel, { color: colors.icon, marginTop: 16 }]}>
+              <Text style={[styles.scheduleLabel, { color: colors.icon, marginTop: 20 }]}>
                 Time of day {hasLaterSelected && availableTimeOptions.length < 4 && '(based on current time)'}
               </Text>
-              <ScrollView horizontal showsHorizontalScrollIndicator={false} contentContainerStyle={styles.pillRow}>
-                <Pill
-                  label="Morning"
-                  selected={selectedTimes.includes('morning')}
-                  onPress={() => toggleTime('morning')}
-                  disabled={hasLaterSelected && !availableTimeOptions.includes('morning')}
-                />
-                <Pill
-                  label="Noon"
-                  selected={selectedTimes.includes('noon')}
-                  onPress={() => toggleTime('noon')}
-                  disabled={hasLaterSelected && !availableTimeOptions.includes('noon')}
-                />
-                <Pill
-                  label="Afternoon"
-                  selected={selectedTimes.includes('afternoon')}
-                  onPress={() => toggleTime('afternoon')}
-                  disabled={hasLaterSelected && !availableTimeOptions.includes('afternoon')}
-                />
-                <Pill
-                  label="Evening"
-                  selected={selectedTimes.includes('evening')}
-                  onPress={() => toggleTime('evening')}
-                  disabled={hasLaterSelected && !availableTimeOptions.includes('evening')}
-                />
-              </ScrollView>
+              <View style={styles.pillRow}>
+                <Pill label="Morning" selected={selectedTimes.includes('morning')} onPress={() => toggleTime('morning')} disabled={hasLaterSelected && !availableTimeOptions.includes('morning')} />
+                <Pill label="Noon" selected={selectedTimes.includes('noon')} onPress={() => toggleTime('noon')} disabled={hasLaterSelected && !availableTimeOptions.includes('noon')} />
+                <Pill label="Afternoon" selected={selectedTimes.includes('afternoon')} onPress={() => toggleTime('afternoon')} disabled={hasLaterSelected && !availableTimeOptions.includes('afternoon')} />
+                <Pill label="Evening" selected={selectedTimes.includes('evening')} onPress={() => toggleTime('evening')} disabled={hasLaterSelected && !availableTimeOptions.includes('evening')} />
+              </View>
 
               <TouchableOpacity
-                style={[styles.confirmButton, { backgroundColor: colors.tint }]}
+                style={[styles.confirmButton, { backgroundColor: colors.tint }, (saving || selectedWhen.length === 0 || selectedTimes.length === 0) && { opacity: 0.6 }]}
                 onPress={handleSchedule}
                 disabled={saving || selectedWhen.length === 0 || selectedTimes.length === 0}
               >
-                {saving ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.confirmButtonText}>Add to availability</Text>}
+                {saving ? <ActivityIndicator color="#fff" size="small" /> : <Text style={styles.confirmButtonText}>Add to Availability</Text>}
               </TouchableOpacity>
             </View>
           )}
 
-          {/* Your Availability - Read-only display */}
+          {/* Your Availability - Compact Preview */}
           {availability.length > 0 && (
-            <TouchableOpacity
-              style={styles.sectionHeader}
-              onPress={() => router.push('/availability')}
-            >
-              <Text style={[styles.sectionTitle, { color: colors.icon }]}>
-                Your Availability ({availability.length})
-              </Text>
-              <Text style={[styles.editLink, { color: colors.tint }]}>Edit</Text>
-            </TouchableOpacity>
-          )}
-
-          {availability.length > 0 && (
-            <View style={[styles.availabilityList, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-              {availability.slice(0, 4).map((item) => {
-                const start = new Date(item.start_ts_utc);
-                const end = new Date(item.end_ts_utc);
-                const now = new Date();
-                const tomorrow = new Date(now);
-                tomorrow.setDate(tomorrow.getDate() + 1);
-                const isToday = start.toDateString() === now.toDateString();
-                const isTomorrow = start.toDateString() === tomorrow.toDateString();
-                const dateStr = isToday ? 'Today' : isTomorrow ? 'Tomorrow' : start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-                const timeStr = `${start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
-
-                return (
-                  <View key={item.id} style={[styles.availItem, { borderBottomColor: isDark ? '#333' : '#eee' }]}>
-                    <Text style={[styles.availDate, { color: colors.text }]}>{dateStr}</Text>
-                    <Text style={[styles.availTime, { color: colors.icon }]}>{timeStr}</Text>
+            <View style={styles.sectionSpacing}>
+              <TouchableOpacity
+                style={[styles.compactSection, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+                onPress={() => router.push('/availability')}
+                activeOpacity={0.7}
+              >
+                <View style={styles.compactHeader}>
+                  <Text style={[styles.compactTitle, { color: colors.text }]}>Your Availability</Text>
+                  <View style={styles.compactBadge}>
+                    <Text style={[styles.compactBadgeText, { color: colors.tint }]}>{availability.length}</Text>
                   </View>
-                );
-              })}
-              {availability.length > 4 && (
-                <Text style={[styles.moreText, { color: colors.icon }]}>+{availability.length - 4} more</Text>
-              )}
+                </View>
+
+                {availability.slice(0, PREVIEW_SLOTS).map((item, idx) => {
+                  const { dateStr, timeStr } = formatSlot(item);
+                  return (
+                    <View key={item.id} style={[styles.slotRow, idx < PREVIEW_SLOTS - 1 && idx < availability.length - 1 && { borderBottomWidth: 1, borderBottomColor: isDark ? '#333' : '#f0f0f0' }]}>
+                      <Text style={[styles.slotDate, { color: colors.text }]}>{dateStr}</Text>
+                      <Text style={[styles.slotTime, { color: colors.icon }]}>{timeStr}</Text>
+                    </View>
+                  );
+                })}
+
+                {availability.length > PREVIEW_SLOTS && (
+                  <View style={styles.seeAllRow}>
+                    <Text style={[styles.seeAllText, { color: colors.tint }]}>See all {availability.length} slots →</Text>
+                  </View>
+                )}
+              </TouchableOpacity>
             </View>
           )}
+
+          {/* Calendar Sync - Collapsed by default */}
+          <View style={styles.sectionSpacing}>
+            <TouchableOpacity
+              style={[styles.compactSection, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+              onPress={() => setShowCalendars(!showCalendars)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.compactHeader}>
+                <Text style={[styles.compactTitle, { color: colors.text }]}>Sync Calendars</Text>
+                <View style={styles.calendarHeaderRight}>
+                  {anyCalendarConnected && (
+                    <View style={[styles.connectedDot, { backgroundColor: '#4caf50' }]} />
+                  )}
+                  <Text style={[styles.chevron, { color: colors.icon }]}>{showCalendars ? '▲' : '▼'}</Text>
+                </View>
+              </View>
+
+              {!showCalendars && anyCalendarConnected && (
+                <Text style={[styles.calendarSummary, { color: colors.icon }]}>
+                  {[googleCalendarConnected && 'Google', appleCalendarSynced && 'iCloud'].filter(Boolean).join(' + ')} connected
+                </Text>
+              )}
+            </TouchableOpacity>
+
+            {showCalendars && (
+              <View style={[styles.calendarList, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+                {/* Google Calendar */}
+                <View style={styles.calendarRow}>
+                  <View style={styles.calendarInfo}>
+                    <View style={styles.calendarNameRow}>
+                      <Text style={[styles.calendarName, { color: colors.text }]}>Google Calendar</Text>
+                      {googleCalendarConnected && <View style={[styles.statusDot, { backgroundColor: '#4caf50' }]} />}
+                    </View>
+                    <Text style={[styles.calendarStatus, { color: colors.icon }]}>
+                      {googleCalendarConnected ? (googleLastSync ? `Synced ${googleLastSync}` : 'Connected') : 'Not connected'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={[styles.calendarAction, googleCalendarConnected ? { backgroundColor: isDark ? '#2a2a2a' : '#f5f5f5' } : { backgroundColor: colors.tint }]}
+                    onPress={googleCalendarConnected ? syncGoogleCalendar : handleConnectGoogle}
+                    disabled={syncingGoogle || saving}
+                  >
+                    {syncingGoogle ? (
+                      <ActivityIndicator size="small" color={googleCalendarConnected ? colors.tint : '#fff'} />
+                    ) : (
+                      <Text style={[styles.calendarActionText, { color: googleCalendarConnected ? colors.tint : '#fff' }]}>
+                        {googleCalendarConnected ? 'Refresh' : 'Connect'}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+
+                <View style={[styles.calendarDivider, { backgroundColor: isDark ? '#333' : '#f0f0f0' }]} />
+
+                {/* iCloud Calendar */}
+                <View style={styles.calendarRow}>
+                  <View style={styles.calendarInfo}>
+                    <View style={styles.calendarNameRow}>
+                      <Text style={[styles.calendarName, { color: colors.text }]}>iCloud Calendar</Text>
+                      {appleCalendarSynced && <View style={[styles.statusDot, { backgroundColor: '#4caf50' }]} />}
+                    </View>
+                    <Text style={[styles.calendarStatus, { color: colors.icon }]}>
+                      {appleCalendarSynced ? (appleLastSync ? `Synced ${appleLastSync}` : 'Connected') : 'Not connected'}
+                    </Text>
+                  </View>
+                  <TouchableOpacity
+                    style={[styles.calendarAction, appleCalendarSynced ? { backgroundColor: isDark ? '#2a2a2a' : '#f5f5f5' } : { backgroundColor: colors.tint }]}
+                    onPress={syncAppleCalendar}
+                    disabled={syncingApple}
+                  >
+                    {syncingApple ? (
+                      <ActivityIndicator size="small" color={appleCalendarSynced ? colors.tint : '#fff'} />
+                    ) : (
+                      <Text style={[styles.calendarActionText, { color: appleCalendarSynced ? colors.tint : '#fff' }]}>
+                        {appleCalendarSynced ? 'Refresh' : 'Connect'}
+                      </Text>
+                    )}
+                  </TouchableOpacity>
+                </View>
+              </View>
+            )}
+          </View>
         </View>
       </ScrollView>
 
@@ -533,10 +576,29 @@ export default function HomeScreen() {
 const styles = StyleSheet.create({
   container: { flex: 1 },
   scrollContent: { flexGrow: 1 },
+
+  // Feedback Banner
+  feedbackBanner: {
+    position: 'absolute',
+    top: 50,
+    left: 20,
+    right: 20,
+    paddingVertical: 12,
+    paddingHorizontal: 16,
+    borderRadius: 10,
+    zIndex: 100,
+  },
+  feedbackText: {
+    fontSize: 14,
+    fontWeight: '500',
+    textAlign: 'center',
+  },
+
+  // Header
   headerRow: {
     flexDirection: 'row',
     justifyContent: 'flex-end',
-    paddingHorizontal: 24,
+    paddingHorizontal: 20,
     paddingTop: 8,
   },
   profileButton: {
@@ -547,72 +609,161 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   profileIcon: { fontSize: 18 },
-  main: { flex: 1, paddingHorizontal: 24, paddingTop: 8 },
-  logoContainer: { alignItems: 'center', marginBottom: 32 },
+
+  // Main content
+  main: { flex: 1, paddingHorizontal: 20 },
+  logoContainer: { alignItems: 'center', marginTop: 8, marginBottom: 32 },
   logo: { fontSize: 48, fontWeight: '900', letterSpacing: 8 },
 
-  // Section headers (consistent style)
-  sectionHeader: {
+  // Primary section (Schedule)
+  primarySection: {
+    borderRadius: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 16,
+  },
+  primaryHeader: {
     flexDirection: 'row',
-    alignItems: 'center',
     justifyContent: 'space-between',
-    paddingVertical: 14,
-  },
-  sectionTitle: { fontSize: 13, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.5 },
-  sectionRight: { flexDirection: 'row', alignItems: 'center', gap: 12 },
-  chevron: { fontSize: 10 },
-  editLink: { fontSize: 13, fontWeight: '600' },
-  refreshBtn: { padding: 4 },
-  refreshText: { fontSize: 18, fontWeight: '600' },
-
-  // Calendar list (settings style)
-  calendarList: {
-    borderRadius: 12,
-    overflow: 'hidden',
-    marginBottom: 8,
-  },
-  calendarItem: {
-    flexDirection: 'row',
     alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingVertical: 14,
-    paddingHorizontal: 16,
   },
-  calendarInfo: { flex: 1 },
-  calendarName: { fontSize: 15, fontWeight: '500' },
-  calendarEmail: { fontSize: 12, marginTop: 2 },
-  syncTime: { fontSize: 11, marginTop: 1 },
-  calendarStatus: { fontSize: 16, fontWeight: '500' },
-  divider: { height: 1, marginLeft: 16 },
+  primaryTitle: {
+    fontSize: 17,
+    fontWeight: '600',
+  },
+  chevron: { fontSize: 12 },
 
   // Schedule card
   scheduleCard: {
-    padding: 20,
-    borderRadius: 12,
-    marginBottom: 8,
+    marginTop: 2,
+    padding: 18,
+    borderRadius: 14,
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
   },
-  scheduleLabel: { fontSize: 12, fontWeight: '600', textTransform: 'uppercase', letterSpacing: 0.5, marginBottom: 10 },
-  pillRow: { flexDirection: 'row', gap: 8, flexWrap: 'wrap' },
-  pill: { paddingHorizontal: 16, paddingVertical: 10, borderRadius: 20 },
+  scheduleLabel: {
+    fontSize: 12,
+    fontWeight: '600',
+    textTransform: 'uppercase',
+    letterSpacing: 0.5,
+    marginBottom: 12,
+  },
+  pillRow: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 10,
+  },
+  pill: {
+    paddingHorizontal: 16,
+    paddingVertical: 10,
+    borderRadius: 20,
+  },
   pillText: { fontSize: 14, fontWeight: '600' },
-  confirmButton: { marginTop: 20, paddingVertical: 14, borderRadius: 12, alignItems: 'center' },
-  confirmButtonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
-
-  // Availability list (read-only)
-  availabilityList: {
+  confirmButton: {
+    marginTop: 24,
+    paddingVertical: 16,
     borderRadius: 12,
-    overflow: 'hidden',
-    marginBottom: 8,
+    alignItems: 'center',
   },
-  availItem: {
+  confirmButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+
+  // Compact sections (Availability, Calendars)
+  sectionSpacing: { marginTop: 16 },
+  compactSection: {
+    borderRadius: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+  },
+  compactHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  compactTitle: {
+    fontSize: 16,
+    fontWeight: '600',
+  },
+  compactBadge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 12,
+  },
+  compactBadgeText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+
+  // Availability slots
+  slotRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
     paddingVertical: 12,
-    paddingHorizontal: 16,
-    borderBottomWidth: 1,
   },
-  availDate: { fontSize: 14, fontWeight: '500' },
-  availTime: { fontSize: 13 },
-  moreText: { fontSize: 12, textAlign: 'center', paddingVertical: 10 },
+  slotDate: { fontSize: 15, fontWeight: '500' },
+  slotTime: { fontSize: 14 },
+  seeAllRow: {
+    paddingTop: 12,
+    alignItems: 'center',
+  },
+  seeAllText: {
+    fontSize: 14,
+    fontWeight: '600',
+  },
+
+  // Calendar section
+  calendarHeaderRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  connectedDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  calendarSummary: {
+    fontSize: 13,
+    marginTop: 4,
+  },
+  calendarList: {
+    marginTop: 2,
+    borderRadius: 14,
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
+    paddingHorizontal: 18,
+    paddingVertical: 8,
+  },
+  calendarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 12,
+  },
+  calendarInfo: { flex: 1 },
+  calendarNameRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  calendarName: { fontSize: 15, fontWeight: '500' },
+  statusDot: {
+    width: 6,
+    height: 6,
+    borderRadius: 3,
+  },
+  calendarStatus: { fontSize: 12, marginTop: 2 },
+  calendarAction: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 18,
+    minWidth: 80,
+    alignItems: 'center',
+  },
+  calendarActionText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  calendarDivider: {
+    height: 1,
+  },
 });

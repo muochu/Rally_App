@@ -9,9 +9,10 @@ import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useAuth } from '@/hooks/use-auth';
 import { CourtSelectionProvider } from '@/hooks/use-court-selection';
 import { Colors } from '@/constants/theme';
+import { ProfileSetupModal } from '@/components/profile-setup-modal';
 
 function AuthGate({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, loading } = useAuth();
+  const { isAuthenticated, loading, profileLoading, isProfileComplete, updateProfile } = useAuth();
   const segments = useSegments();
   const router = useRouter();
   const colorScheme = useColorScheme() ?? 'light';
@@ -20,6 +21,10 @@ function AuthGate({ children }: { children: React.ReactNode }) {
     if (loading) return;
 
     const inAuthGroup = segments[0] === '(auth)';
+    const isInviteRoute = segments[0] === 'invite';
+
+    // Allow invite route without auth - it handles its own auth state
+    if (isInviteRoute) return;
 
     if (!isAuthenticated && !inAuthGroup) {
       // Redirect to login
@@ -30,7 +35,12 @@ function AuthGate({ children }: { children: React.ReactNode }) {
     }
   }, [isAuthenticated, loading, segments]);
 
-  if (loading) {
+  // Handle profile setup completion
+  const handleProfileComplete = async (displayName: string, discoverable: boolean) => {
+    await updateProfile({ display_name: displayName, discoverable });
+  };
+
+  if (loading || (isAuthenticated && profileLoading)) {
     return (
       <View style={{ flex: 1, justifyContent: 'center', alignItems: 'center', backgroundColor: Colors[colorScheme].background }}>
         <ActivityIndicator size="large" color={Colors[colorScheme].tint} />
@@ -38,7 +48,18 @@ function AuthGate({ children }: { children: React.ReactNode }) {
     );
   }
 
-  return <>{children}</>;
+  // Show profile setup modal if authenticated but profile incomplete
+  const showProfileSetup = isAuthenticated && !isProfileComplete;
+
+  return (
+    <>
+      {children}
+      <ProfileSetupModal
+        visible={showProfileSetup}
+        onComplete={handleProfileComplete}
+      />
+    </>
+  );
 }
 
 export default function RootLayout() {
@@ -51,6 +72,8 @@ export default function RootLayout() {
           <Stack>
             <Stack.Screen name="(auth)" options={{ headerShown: false }} />
             <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+            <Stack.Screen name="invite" options={{ headerShown: false }} />
+            <Stack.Screen name="friend/[id]" options={{ headerShown: false }} />
             <Stack.Screen name="booking/[id]" options={{ headerShown: false }} />
             <Stack.Screen name="modal" options={{ presentation: 'modal', title: 'Modal' }} />
           </Stack>

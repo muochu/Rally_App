@@ -54,7 +54,12 @@ export default function AvailabilityScreen() {
   const [showSettings, setShowSettings] = useState(false);
   const [savingSlot, setSavingSlot] = useState<string | null>(null);
   const [editingSlot, setEditingSlot] = useState<AvailabilityWindow | null>(null);
-  const [editTimeOfDay, setEditTimeOfDay] = useState<'morning' | 'noon' | 'afternoon' | 'evening'>('morning');
+  const [editTimeOfDay, setEditTimeOfDay] = useState<TimeOfDay>('morning');
+
+  // Collapsible section states
+  const [showSuggested, setShowSuggested] = useState(true);
+  const [showAvailability, setShowAvailability] = useState(true);
+  const [showBusyBlocks, setShowBusyBlocks] = useState(false);
 
   const loadData = useCallback(async () => {
     if (!userId) return;
@@ -67,7 +72,6 @@ export default function AvailabilityScreen() {
       const now = new Date();
       const sevenDaysLater = new Date(now.getTime() + 7 * 24 * 60 * 60 * 1000);
 
-      // Filter availability to next 7 days
       const filteredAvail = availData.filter((a) => {
         const start = new Date(a.start_ts_utc);
         const end = new Date(a.end_ts_utc);
@@ -76,7 +80,6 @@ export default function AvailabilityScreen() {
         new Date(a.start_ts_utc).getTime() - new Date(b.start_ts_utc).getTime()
       );
 
-      // Filter busy blocks to next 7 days
       const filteredBusy = busyData.filter((b) => {
         const start = new Date(b.start_ts_utc);
         const end = new Date(b.end_ts_utc);
@@ -86,7 +89,6 @@ export default function AvailabilityScreen() {
       setAvailability(filteredAvail);
       setBusyBlocks(filteredBusy);
 
-      // Generate recommendations based on busy blocks
       const recs = generateRecommendations(filteredBusy, filteredAvail);
       setRecommendations(recs);
       setRecOffset(0);
@@ -102,7 +104,6 @@ export default function AvailabilityScreen() {
     loadData();
   }, [loadData]);
 
-  // Reload when tab comes into focus
   useFocusEffect(
     useCallback(() => {
       loadData();
@@ -112,12 +113,9 @@ export default function AvailabilityScreen() {
   const generateRecommendations = (busy: BusyBlock[], existing: AvailabilityWindow[]): RecommendedSlot[] => {
     const recs: RecommendedSlot[] = [];
     const now = new Date();
-
-    // Track last recommended end time to avoid consecutive slots
     let lastRecEndHour = -1;
     let lastRecDate = '';
 
-    // Look at the next 7 days
     for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
       const date = new Date(now);
       date.setDate(date.getDate() + dayOffset);
@@ -131,24 +129,18 @@ export default function AvailabilityScreen() {
       const dayEnd = new Date(date);
       dayEnd.setHours(23, 59, 59, 999);
 
-      // Get busy blocks for this day
       const dayBusy = busy.filter((b) => {
         const bStart = new Date(b.start_ts_utc);
         const bEnd = new Date(b.end_ts_utc);
         return bStart < dayEnd && bEnd > dayStart;
       });
 
-      // Get existing availability for this day
       const dayAvail = existing.filter((a) => {
         const aStart = new Date(a.start_ts_utc);
         const aEnd = new Date(a.end_ts_utc);
         return aStart < dayEnd && aEnd > dayStart;
       });
 
-      // Consistent time ranges across the app:
-      // Morning: 6am-10am, Noon: 10am-1pm, Afternoon: 1pm-5pm, Evening: 5pm-9pm
-      // Weekdays: prefer outside 9-5 work hours (morning before 9, evening after 5)
-      // Weekends: all times are fair game
       const windows = isWeekday ? [
         { start: 6, end: 10, label: 'Morning', reason: 'Before work' },
         { start: 17, end: 21, label: 'Evening', reason: 'After work hours' },
@@ -165,23 +157,17 @@ export default function AvailabilityScreen() {
         const windowEnd = new Date(date);
         windowEnd.setHours(window.end, 0, 0, 0);
 
-        // Skip if in the past
         if (windowEnd <= now) continue;
-
-        // Skip consecutive slots on the same day (e.g., don't show both After work and Evening)
         if (dateKey === lastRecDate && window.start <= lastRecEndHour) continue;
 
-        // Adjust start if partially in the past
         const effectiveStart = windowStart < now ? now : windowStart;
 
-        // Check if this window overlaps with any busy block
         const isBusy = dayBusy.some((b) => {
           const bStart = new Date(b.start_ts_utc);
           const bEnd = new Date(b.end_ts_utc);
           return bStart < windowEnd && bEnd > effectiveStart;
         });
 
-        // Check if already have availability in this window
         const hasAvail = dayAvail.some((a) => {
           const aStart = new Date(a.start_ts_utc);
           const aEnd = new Date(a.end_ts_utc);
@@ -192,7 +178,6 @@ export default function AvailabilityScreen() {
           const dayLabel = dayOffset === 0 ? 'Today' : dayOffset === 1 ? 'Tomorrow' :
             date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 
-          // Customize reason based on surrounding busy blocks
           let reason = window.reason;
           const beforeBusy = dayBusy.find((b) => {
             const bEnd = new Date(b.end_ts_utc);
@@ -218,16 +203,13 @@ export default function AvailabilityScreen() {
             reason,
           });
 
-          // Track this to avoid consecutive recommendations
           lastRecEndHour = window.end;
           lastRecDate = dateKey;
 
-          // Limit to 4 recommendations
           if (recs.length >= 9) return recs;
         }
       }
 
-      // Reset tracking for next day
       if (dateKey !== lastRecDate) {
         lastRecEndHour = -1;
       }
@@ -242,7 +224,7 @@ export default function AvailabilityScreen() {
   };
 
   const handleDelete = (id: string) => {
-    Alert.alert('Remove', 'Remove this availability?', [
+    Alert.alert('Remove Slot', 'Remove this availability?', [
       { text: 'Cancel', style: 'cancel' },
       {
         text: 'Remove',
@@ -251,6 +233,7 @@ export default function AvailabilityScreen() {
           try {
             await availabilityApi.delete(id);
             setAvailability((prev) => prev.filter((a) => a.id !== id));
+            loadData();
           } catch (e) {
             Alert.alert('Error', 'Failed to remove');
           }
@@ -295,7 +278,7 @@ export default function AvailabilityScreen() {
               await availabilityApi.delete(a.id);
             }
             setAvailability([]);
-            loadData(); // Regenerate recommendations
+            loadData();
           } catch (e) {
             Alert.alert('Error', 'Failed to clear');
           }
@@ -356,26 +339,10 @@ export default function AvailabilityScreen() {
     const isToday = s.toDateString() === now.toDateString();
     const isTomorrow = s.toDateString() === tomorrow.toDateString();
 
-    let dateStr: string;
-    if (isToday) {
-      dateStr = 'Today';
-    } else if (isTomorrow) {
-      dateStr = 'Tomorrow';
-    } else {
-      dateStr = s.toLocaleDateString(undefined, {
-        weekday: 'short',
-        month: 'short',
-        day: 'numeric',
-      });
-    }
+    const dateStr = isToday ? 'Today' : isTomorrow ? 'Tomorrow' :
+      s.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
 
-    const timeStr = `${s.toLocaleTimeString(undefined, {
-      hour: 'numeric',
-      minute: '2-digit',
-    })} – ${e.toLocaleTimeString(undefined, {
-      hour: 'numeric',
-      minute: '2-digit',
-    })}`;
+    const timeStr = `${s.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${e.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
 
     return { date: dateStr, time: timeStr };
   };
@@ -399,6 +366,7 @@ export default function AvailabilityScreen() {
   }
 
   const hasCalendarSync = googleCalendarConnected || busyBlocks.length > 0;
+  const visibleRecs = recommendations.slice(recOffset, recOffset + 3);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
@@ -406,14 +374,12 @@ export default function AvailabilityScreen() {
         style={styles.scrollView}
         contentContainerStyle={styles.content}
         showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
-        }
+        refreshControl={<RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />}
       >
-        {/* Header with Profile */}
+        {/* Header */}
         <View style={styles.headerRow}>
           <View style={styles.headerText}>
-            <Text style={[styles.title, { color: colors.text }]}>AVAILABILITY</Text>
+            <Text style={[styles.title, { color: colors.text }]}>Availability</Text>
             <Text style={[styles.subtitle, { color: colors.icon }]}>Next 7 days</Text>
           </View>
           <TouchableOpacity
@@ -424,166 +390,228 @@ export default function AvailabilityScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* Smart Recommendations based on calendar */}
+        {/* SECTION 1: Suggested Times (collapsible) */}
         {hasCalendarSync && recommendations.length > 0 && (
-          <>
-            <View style={styles.sectionHeader}>
-              <Text style={[styles.sectionTitle, { color: colors.text }]}>Suggested Times</Text>
-              <Text style={[styles.sectionHint, { color: colors.icon }]}>Based on your calendar</Text>
-            </View>
-
-            {recommendations.slice(recOffset, recOffset + 3).map((rec, idx) => (
-              <TouchableOpacity
-                key={rec.start.toISOString()}
-                style={[styles.recCard, { backgroundColor: isDark ? '#1a2a1a' : '#e8f5e9' }]}
-                onPress={() => handleAddRecommendation(rec)}
-                disabled={savingSlot === rec.start.toISOString()}
-              >
-                <View style={styles.recInfo}>
-                  <Text style={[styles.recLabel, { color: colors.text }]}>{rec.label}</Text>
-                  <Text style={[styles.recTime, { color: colors.icon }]}>
-                    {rec.start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – {rec.end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
-                  </Text>
-                  <Text style={[styles.recReason, { color: '#4caf50' }]}>{rec.reason}</Text>
+          <View style={styles.section}>
+            <TouchableOpacity
+              style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+              onPress={() => setShowSuggested(!showSuggested)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.sectionHeader}>
+                <View>
+                  <Text style={[styles.sectionTitle, { color: colors.text }]}>Suggested Times</Text>
+                  <Text style={[styles.sectionSubtitle, { color: colors.icon }]}>Based on your calendar</Text>
                 </View>
-                {savingSlot === rec.start.toISOString() ? (
-                  <ActivityIndicator size="small" color="#4caf50" />
-                ) : (
-                  <Text style={styles.recAdd}>+ Add</Text>
-                )}
-              </TouchableOpacity>
-            ))}
+                <View style={styles.sectionRight}>
+                  <View style={[styles.badge, { backgroundColor: '#4caf50' + '20' }]}>
+                    <Text style={[styles.badgeText, { color: '#4caf50' }]}>{recommendations.length}</Text>
+                  </View>
+                  <Text style={[styles.chevron, { color: colors.icon }]}>{showSuggested ? '▲' : '▼'}</Text>
+                </View>
+              </View>
+            </TouchableOpacity>
 
-            {recommendations.length > 3 && (
-              <TouchableOpacity
-                style={styles.showMoreBtn}
-                onPress={() => setRecOffset((prev) => (prev + 3 >= recommendations.length ? 0 : prev + 3))}
-              >
-                <Text style={[styles.showMoreText, { color: colors.tint }]}>
-                  {recOffset + 3 >= recommendations.length ? 'Show first 3' : `Show more (${recommendations.length - recOffset - 3} left)`}
-                </Text>
-              </TouchableOpacity>
+            {showSuggested && (
+              <View style={[styles.sectionContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+                {visibleRecs.map((rec, idx) => (
+                  <TouchableOpacity
+                    key={rec.start.toISOString()}
+                    style={[
+                      styles.recRow,
+                      idx < visibleRecs.length - 1 && { borderBottomWidth: 1, borderBottomColor: isDark ? '#333' : '#f0f0f0' },
+                    ]}
+                    onPress={() => handleAddRecommendation(rec)}
+                    disabled={savingSlot === rec.start.toISOString()}
+                  >
+                    <View style={styles.recInfo}>
+                      <Text style={[styles.recLabel, { color: colors.text }]}>{rec.label}</Text>
+                      <Text style={[styles.recTime, { color: colors.icon }]}>
+                        {rec.start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – {rec.end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
+                      </Text>
+                      <Text style={[styles.recReason, { color: '#4caf50' }]}>{rec.reason}</Text>
+                    </View>
+                    {savingSlot === rec.start.toISOString() ? (
+                      <ActivityIndicator size="small" color="#4caf50" />
+                    ) : (
+                      <View style={[styles.addBtnSmall, { backgroundColor: '#4caf50' }]}>
+                        <Text style={styles.addBtnSmallText}>Add</Text>
+                      </View>
+                    )}
+                  </TouchableOpacity>
+                ))}
+
+                {recommendations.length > 3 && (
+                  <TouchableOpacity
+                    style={styles.showMoreRow}
+                    onPress={() => setRecOffset((prev) => (prev + 3 >= recommendations.length ? 0 : prev + 3))}
+                  >
+                    <Text style={[styles.showMoreText, { color: colors.tint }]}>
+                      {recOffset + 3 >= recommendations.length ? 'Show first 3' : `Show more →`}
+                    </Text>
+                  </TouchableOpacity>
+                )}
+              </View>
             )}
-          </>
+          </View>
         )}
 
-        {/* Current Availability */}
-        {availability.length === 0 ? (
-          <View style={[styles.emptyCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-            <Text style={styles.emptyIcon}>📅</Text>
-            <Text style={[styles.emptyText, { color: colors.text }]}>
-              No availability set
-            </Text>
-            <Text style={[styles.emptyHint, { color: colors.icon }]}>
-              {hasCalendarSync
-                ? 'Tap a suggested time above or add from the home tab'
-                : 'Set when you can play from the home tab'
-              }
-            </Text>
-            <TouchableOpacity
-              style={[styles.addButton, { backgroundColor: colors.tint }]}
-              onPress={() => router.push('/')}
-            >
-              <Text style={styles.addButtonText}>⚡ Set Availability</Text>
-            </TouchableOpacity>
-          </View>
-        ) : (
-          <>
-            <View style={styles.header}>
-              <Text style={[styles.count, { color: colors.text }]}>
-                Your availability ({availability.length})
-              </Text>
-              <TouchableOpacity onPress={handleClearAll}>
-                <Text style={styles.clearAll}>Clear all</Text>
-              </TouchableOpacity>
+        {/* SECTION 2: Your Availability (collapsible) */}
+        <View style={styles.section}>
+          <TouchableOpacity
+            style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+            onPress={() => setShowAvailability(!showAvailability)}
+            activeOpacity={0.7}
+          >
+            <View style={styles.sectionHeader}>
+              <View>
+                <Text style={[styles.sectionTitle, { color: colors.text }]}>Your Availability</Text>
+                <Text style={[styles.sectionSubtitle, { color: colors.icon }]}>Tap to edit, swipe to delete</Text>
+              </View>
+              <View style={styles.sectionRight}>
+                <View style={[styles.badge, { backgroundColor: colors.tint + '20' }]}>
+                  <Text style={[styles.badgeText, { color: colors.tint }]}>{availability.length}</Text>
+                </View>
+                <Text style={[styles.chevron, { color: colors.icon }]}>{showAvailability ? '▲' : '▼'}</Text>
+              </View>
             </View>
+          </TouchableOpacity>
 
-            {availability.map((item) => {
-              const { date, time } = formatSlot(item.start_ts_utc, item.end_ts_utc);
-              const timeOfDay = getTimeOfDayLabel(item.start_ts_utc);
-              return (
-                <TouchableOpacity
-                  key={item.id}
-                  style={[styles.slotCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
-                  onPress={() => handleEditSlot(item)}
-                  activeOpacity={0.7}
-                >
-                  <View style={styles.slotInfo}>
-                    <View style={styles.slotHeader}>
-                      <Text style={[styles.slotDate, { color: colors.text }]}>{date}</Text>
-                      <View style={[styles.timeBadge, { backgroundColor: colors.tint + '20' }]}>
-                        <Text style={[styles.timeBadgeText, { color: colors.tint }]}>{timeOfDay}</Text>
+          {showAvailability && (
+            <View style={[styles.sectionContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+              {availability.length === 0 ? (
+                <View style={styles.emptyState}>
+                  <Text style={styles.emptyIcon}>📅</Text>
+                  <Text style={[styles.emptyText, { color: colors.text }]}>No availability set</Text>
+                  <Text style={[styles.emptyHint, { color: colors.icon }]}>
+                    {hasCalendarSync ? 'Add a suggested time above' : 'Set when you can play from the home tab'}
+                  </Text>
+                </View>
+              ) : (
+                <>
+                  {availability.map((item, idx) => {
+                    const { date, time } = formatSlot(item.start_ts_utc, item.end_ts_utc);
+                    const timeOfDay = getTimeOfDayLabel(item.start_ts_utc);
+                    return (
+                      <TouchableOpacity
+                        key={item.id}
+                        style={[
+                          styles.slotRow,
+                          idx < availability.length - 1 && { borderBottomWidth: 1, borderBottomColor: isDark ? '#333' : '#f0f0f0' },
+                        ]}
+                        onPress={() => handleEditSlot(item)}
+                        onLongPress={() => handleDelete(item.id)}
+                        activeOpacity={0.7}
+                      >
+                        <View style={styles.slotInfo}>
+                          <View style={styles.slotHeaderRow}>
+                            <Text style={[styles.slotDate, { color: colors.text }]}>{date}</Text>
+                            <View style={[styles.timeBadge, { backgroundColor: colors.tint + '15' }]}>
+                              <Text style={[styles.timeBadgeText, { color: colors.tint }]}>{timeOfDay}</Text>
+                            </View>
+                          </View>
+                          <Text style={[styles.slotTime, { color: colors.icon }]}>{time}</Text>
+                        </View>
+                        <Text style={[styles.editChevron, { color: colors.icon }]}>›</Text>
+                      </TouchableOpacity>
+                    );
+                  })}
+
+                  <View style={styles.actionRow}>
+                    <TouchableOpacity style={styles.clearBtn} onPress={handleClearAll}>
+                      <Text style={styles.clearBtnText}>Clear all</Text>
+                    </TouchableOpacity>
+                  </View>
+                </>
+              )}
+            </View>
+          )}
+        </View>
+
+        {/* Add Availability Button */}
+        <TouchableOpacity
+          style={[styles.addButton, { backgroundColor: colors.tint }]}
+          onPress={() => router.push('/')}
+        >
+          <Text style={styles.addButtonText}>+ Add Availability</Text>
+        </TouchableOpacity>
+
+        {/* SECTION 3: Calendar Busy Times (collapsible, collapsed by default) */}
+        {busyBlocks.length > 0 && (
+          <View style={styles.section}>
+            <TouchableOpacity
+              style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+              onPress={() => setShowBusyBlocks(!showBusyBlocks)}
+              activeOpacity={0.7}
+            >
+              <View style={styles.sectionHeader}>
+                <View>
+                  <Text style={[styles.sectionTitle, { color: colors.text }]}>Calendar Busy Times</Text>
+                  <Text style={[styles.sectionSubtitle, { color: colors.icon }]}>Imported from connected calendars</Text>
+                </View>
+                <View style={styles.sectionRight}>
+                  <View style={[styles.badge, { backgroundColor: isDark ? '#333' : '#eee' }]}>
+                    <Text style={[styles.badgeText, { color: colors.icon }]}>{busyBlocks.length}</Text>
+                  </View>
+                  <Text style={[styles.chevron, { color: colors.icon }]}>{showBusyBlocks ? '▲' : '▼'}</Text>
+                </View>
+              </View>
+            </TouchableOpacity>
+
+            {showBusyBlocks && (
+              <View style={[styles.sectionContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+                {busyBlocks.slice(0, 10).map((block, idx) => {
+                  const start = new Date(block.start_ts_utc);
+                  const end = new Date(block.end_ts_utc);
+                  const now = new Date();
+                  const isToday = start.toDateString() === now.toDateString();
+                  const dateStr = isToday ? 'Today' : start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+                  const timeStr = `${start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
+                  const isGoogle = block.source === 'google';
+
+                  return (
+                    <View
+                      key={block.id || idx}
+                      style={[
+                        styles.busyRow,
+                        idx < Math.min(busyBlocks.length, 10) - 1 && { borderBottomWidth: 1, borderBottomColor: isDark ? '#333' : '#f0f0f0' },
+                      ]}
+                    >
+                      <View style={[styles.busyIndicator, { backgroundColor: isGoogle ? '#4285f4' : '#ff9500' }]} />
+                      <View style={styles.busyInfo}>
+                        <Text style={[styles.busyDate, { color: colors.text }]}>{dateStr}</Text>
+                        <Text style={[styles.busyTime, { color: colors.icon }]}>{timeStr}</Text>
+                      </View>
+                      <View style={[styles.sourceTag, { backgroundColor: isGoogle ? '#4285f415' : '#ff950015' }]}>
+                        <Text style={[styles.sourceTagText, { color: isGoogle ? '#4285f4' : '#ff9500' }]}>
+                          {isGoogle ? 'Google' : 'iCloud'}
+                        </Text>
                       </View>
                     </View>
-                    <Text style={[styles.slotTime, { color: colors.icon }]}>{time}</Text>
-                  </View>
-                  <Text style={[styles.editHint, { color: colors.icon }]}>Edit</Text>
-                </TouchableOpacity>
-              );
-            })}
+                  );
+                })}
 
-            <TouchableOpacity
-              style={[styles.addMoreButton, { borderColor: colors.tint }]}
-              onPress={() => router.push('/')}
-            >
-              <Text style={[styles.addMoreText, { color: colors.tint }]}>+ Add more availability</Text>
-            </TouchableOpacity>
-          </>
-        )}
-
-        {/* Calendar sync status with details */}
-        {busyBlocks.length > 0 && (
-          <View style={[styles.busySection, { backgroundColor: isDark ? '#1a1a1a' : '#f8f8f8' }]}>
-            <Text style={[styles.busySectionTitle, { color: colors.text }]}>
-              📅 Calendar Busy Times ({busyBlocks.length})
-            </Text>
-            <Text style={[styles.busySectionHint, { color: colors.icon }]}>
-              Imported from your connected calendars
-            </Text>
-
-            {busyBlocks.slice(0, 10).map((block, idx) => {
-              const start = new Date(block.start_ts_utc);
-              const end = new Date(block.end_ts_utc);
-              const now = new Date();
-              const isToday = start.toDateString() === now.toDateString();
-              const dateStr = isToday ? 'Today' : start.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-              const timeStr = `${start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – ${end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}`;
-
-              return (
-                <View key={block.id || idx} style={[styles.busyBlock, { borderLeftColor: block.source === 'google' ? '#4285f4' : '#666' }]}>
-                  <View style={styles.busyBlockInfo}>
-                    <Text style={[styles.busyBlockDate, { color: colors.text }]}>{dateStr}</Text>
-                    <Text style={[styles.busyBlockTime, { color: colors.icon }]}>{timeStr}</Text>
-                  </View>
-                  <View style={[styles.sourceTag, { backgroundColor: block.source === 'google' ? '#4285f420' : '#66666620' }]}>
-                    <Text style={[styles.sourceTagText, { color: block.source === 'google' ? '#4285f4' : '#666' }]}>
-                      {block.source === 'google' ? 'Google' : 'Apple'}
-                    </Text>
-                  </View>
-                </View>
-              );
-            })}
-
-            {busyBlocks.length > 10 && (
-              <Text style={[styles.moreBlocks, { color: colors.icon }]}>
-                +{busyBlocks.length - 10} more
-              </Text>
+                {busyBlocks.length > 10 && (
+                  <Text style={[styles.moreText, { color: colors.icon }]}>
+                    +{busyBlocks.length - 10} more
+                  </Text>
+                )}
+              </View>
             )}
           </View>
         )}
       </ScrollView>
 
-      {/* Edit Time Modal */}
+      {/* Edit Modal */}
       <Modal visible={!!editingSlot} animationType="slide" transparent>
         <View style={styles.modalOverlay}>
           <View style={[styles.modalContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-            <Text style={[styles.modalTitle, { color: colors.text }]}>Edit Time</Text>
+            <View style={styles.modalHandle} />
+            <Text style={[styles.modalTitle, { color: colors.text }]}>Edit Time Slot</Text>
             {editingSlot && (
               <Text style={[styles.modalDate, { color: colors.icon }]}>
                 {new Date(editingSlot.start_ts_utc).toLocaleDateString(undefined, {
-                  weekday: 'long',
-                  month: 'short',
-                  day: 'numeric',
+                  weekday: 'long', month: 'long', day: 'numeric',
                 })}
               </Text>
             )}
@@ -599,12 +627,7 @@ export default function AvailabilityScreen() {
                   ]}
                   onPress={() => setEditTimeOfDay(t)}
                 >
-                  <Text
-                    style={[
-                      styles.timeOptionText,
-                      { color: editTimeOfDay === t ? '#fff' : colors.text },
-                    ]}
-                  >
+                  <Text style={[styles.timeOptionText, { color: editTimeOfDay === t ? '#fff' : colors.text }]}>
                     {TIME_RANGES[t].label}
                   </Text>
                 </TouchableOpacity>
@@ -655,7 +678,9 @@ const styles = StyleSheet.create({
   container: { flex: 1 },
   centered: { flex: 1, justifyContent: 'center', alignItems: 'center' },
   scrollView: { flex: 1 },
-  content: { padding: 24 },
+  content: { padding: 20, paddingBottom: 40 },
+
+  // Header
   headerRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
@@ -663,8 +688,8 @@ const styles = StyleSheet.create({
     marginBottom: 24,
   },
   headerText: { flex: 1 },
-  title: { fontSize: 32, fontWeight: '900', letterSpacing: 3 },
-  subtitle: { fontSize: 15, marginTop: 4 },
+  title: { fontSize: 28, fontWeight: '700' },
+  subtitle: { fontSize: 14, marginTop: 4 },
   profileButton: {
     width: 40,
     height: 40,
@@ -673,110 +698,134 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
   },
   profileIcon: { fontSize: 18 },
-  sectionHeader: { marginBottom: 12 },
-  sectionTitle: { fontSize: 16, fontWeight: '700' },
-  sectionHint: { fontSize: 13, marginTop: 2 },
-  recCard: {
+
+  // Sections
+  section: { marginBottom: 16 },
+  sectionCard: {
+    borderRadius: 14,
+    paddingHorizontal: 18,
+    paddingVertical: 14,
+  },
+  sectionHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+  },
+  sectionTitle: { fontSize: 16, fontWeight: '600' },
+  sectionSubtitle: { fontSize: 12, marginTop: 2 },
+  sectionRight: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 14,
-    borderRadius: 12,
-    marginBottom: 10,
+    gap: 10,
+  },
+  badge: {
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 10,
+  },
+  badgeText: { fontSize: 13, fontWeight: '600' },
+  chevron: { fontSize: 12 },
+  sectionContent: {
+    marginTop: 2,
+    borderRadius: 14,
+    borderTopLeftRadius: 0,
+    borderTopRightRadius: 0,
+    paddingHorizontal: 18,
+    paddingVertical: 4,
+  },
+
+  // Recommendations
+  recRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
   },
   recInfo: { flex: 1 },
   recLabel: { fontSize: 15, fontWeight: '600' },
   recTime: { fontSize: 13, marginTop: 2 },
   recReason: { fontSize: 12, marginTop: 4, fontWeight: '500' },
-  recAdd: { color: '#4caf50', fontSize: 14, fontWeight: '700' },
-  showMoreBtn: { alignItems: 'center', paddingVertical: 12, marginBottom: 8 },
+  addBtnSmall: {
+    paddingHorizontal: 14,
+    paddingVertical: 6,
+    borderRadius: 14,
+  },
+  addBtnSmallText: { color: '#fff', fontSize: 13, fontWeight: '600' },
+  showMoreRow: {
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
   showMoreText: { fontSize: 14, fontWeight: '600' },
-  header: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 16,
-    marginTop: 8,
-  },
-  count: { fontSize: 15, fontWeight: '600' },
-  clearAll: { color: '#e53935', fontSize: 14, fontWeight: '500' },
-  emptyCard: {
-    padding: 40,
-    borderRadius: 16,
-    alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
-  },
-  emptyIcon: { fontSize: 48, marginBottom: 16 },
-  emptyText: { fontSize: 17, fontWeight: '600', marginBottom: 8 },
-  emptyHint: { fontSize: 14, textAlign: 'center', marginBottom: 20 },
-  addButton: { paddingHorizontal: 24, paddingVertical: 12, borderRadius: 12 },
-  addButtonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
-  slotCard: {
+
+  // Availability slots
+  slotRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    padding: 16,
-    borderRadius: 12,
-    marginBottom: 10,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 1,
+    paddingVertical: 14,
   },
   slotInfo: { flex: 1 },
-  slotHeader: { flexDirection: 'row', alignItems: 'center', gap: 10 },
-  slotDate: { fontSize: 16, fontWeight: '600' },
-  timeBadge: { paddingHorizontal: 8, paddingVertical: 2, borderRadius: 8 },
-  timeBadgeText: { fontSize: 12, fontWeight: '600' },
-  slotTime: { fontSize: 14, marginTop: 4 },
-  removeButton: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: 'rgba(229, 57, 53, 0.1)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  removeText: { color: '#e53935', fontSize: 14, fontWeight: '600' },
-  addMoreButton: {
-    marginTop: 8,
-    paddingVertical: 14,
-    borderRadius: 12,
-    borderWidth: 1.5,
-    alignItems: 'center',
-  },
-  addMoreText: { fontSize: 15, fontWeight: '600' },
-  busySection: {
-    marginTop: 24,
-    padding: 16,
-    borderRadius: 12,
-  },
-  busySectionTitle: { fontSize: 15, fontWeight: '600', marginBottom: 4 },
-  busySectionHint: { fontSize: 12, marginBottom: 12 },
-  busyBlock: {
+  slotHeaderRow: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingVertical: 10,
-    borderLeftWidth: 3,
-    paddingLeft: 12,
-    marginBottom: 8,
+    gap: 10,
   },
-  busyBlockInfo: { flex: 1 },
-  busyBlockDate: { fontSize: 14, fontWeight: '500' },
-  busyBlockTime: { fontSize: 12, marginTop: 2 },
-  sourceTag: {
+  slotDate: { fontSize: 15, fontWeight: '600' },
+  timeBadge: {
     paddingHorizontal: 8,
     paddingVertical: 3,
+    borderRadius: 8,
+  },
+  timeBadgeText: { fontSize: 11, fontWeight: '600' },
+  slotTime: { fontSize: 13, marginTop: 4 },
+  editChevron: { fontSize: 22, fontWeight: '300' },
+  actionRow: {
+    paddingVertical: 12,
+    alignItems: 'center',
+  },
+  clearBtn: {},
+  clearBtnText: { color: '#e53935', fontSize: 14, fontWeight: '500' },
+
+  // Empty state
+  emptyState: {
+    paddingVertical: 32,
+    alignItems: 'center',
+  },
+  emptyIcon: { fontSize: 40, marginBottom: 12 },
+  emptyText: { fontSize: 16, fontWeight: '600', marginBottom: 6 },
+  emptyHint: { fontSize: 13, textAlign: 'center' },
+
+  // Add button
+  addButton: {
+    paddingVertical: 16,
+    borderRadius: 14,
+    alignItems: 'center',
+    marginBottom: 16,
+  },
+  addButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+
+  // Busy blocks
+  busyRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 12,
+  },
+  busyIndicator: {
+    width: 4,
+    height: 36,
+    borderRadius: 2,
+    marginRight: 12,
+  },
+  busyInfo: { flex: 1 },
+  busyDate: { fontSize: 14, fontWeight: '500' },
+  busyTime: { fontSize: 12, marginTop: 2 },
+  sourceTag: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
     borderRadius: 6,
   },
   sourceTagText: { fontSize: 11, fontWeight: '600' },
-  moreBlocks: { fontSize: 12, textAlign: 'center', marginTop: 8 },
-  editHint: { fontSize: 13, fontWeight: '500' },
+  moreText: { fontSize: 12, textAlign: 'center', paddingVertical: 12 },
 
-  // Edit Modal
+  // Modal
   modalOverlay: {
     flex: 1,
     backgroundColor: 'rgba(0,0,0,0.5)',
@@ -788,11 +837,19 @@ const styles = StyleSheet.create({
     padding: 24,
     paddingBottom: 40,
   },
+  modalHandle: {
+    width: 36,
+    height: 4,
+    backgroundColor: '#ccc',
+    borderRadius: 2,
+    alignSelf: 'center',
+    marginBottom: 16,
+  },
   modalTitle: { fontSize: 20, fontWeight: '700', textAlign: 'center' },
-  modalDate: { fontSize: 14, textAlign: 'center', marginTop: 4, marginBottom: 20 },
+  modalDate: { fontSize: 14, textAlign: 'center', marginTop: 4, marginBottom: 24 },
   timeOptions: { gap: 10 },
   timeOption: {
-    paddingVertical: 14,
+    paddingVertical: 16,
     paddingHorizontal: 16,
     borderRadius: 12,
   },
@@ -804,13 +861,13 @@ const styles = StyleSheet.create({
   },
   modalBtn: {
     flex: 1,
-    paddingVertical: 14,
+    paddingVertical: 16,
     borderRadius: 12,
     alignItems: 'center',
   },
-  modalBtnText: { fontSize: 15, fontWeight: '600' },
+  modalBtnText: { fontSize: 16, fontWeight: '600' },
   deleteBtn: {
-    marginTop: 16,
+    marginTop: 20,
     alignItems: 'center',
   },
   deleteBtnText: { color: '#e53935', fontSize: 14, fontWeight: '500' },

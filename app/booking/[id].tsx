@@ -14,7 +14,7 @@ import { useLocalSearchParams, useRouter, Stack } from 'expo-router';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { useAuth } from '@/hooks/use-auth';
 import { Colors } from '@/constants/theme';
-import { bookingsApi, supabase } from '@/lib/supabase';
+import { bookingsApi, proposalsApi, supabase } from '@/lib/supabase';
 import { addBookingToCalendar, requestCalendarPermission, getCalendarPermissionStatus } from '@/lib/calendar';
 import { formatTimeSlot, toTimeSlot } from '@/lib/scheduling';
 import type { Booking } from '@/lib/types';
@@ -31,6 +31,7 @@ export default function BookingDetailScreen() {
   const [error, setError] = useState<string | null>(null);
   const [addingToCalendar, setAddingToCalendar] = useState(false);
   const [addedToCalendar, setAddedToCalendar] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
 
   useEffect(() => {
     loadBooking();
@@ -53,20 +54,31 @@ export default function BookingDetailScreen() {
         // Fetch booking by proposal ID
         const { data, error: fetchError } = await supabase
           .from('bookings')
-          .select(`
-            *,
-            court:courts(*),
-            proposal:proposals(
-              *,
-              from_user:profiles!proposals_from_user_id_fkey(email, display_name),
-              to_user:profiles!proposals_to_user_id_fkey(email, display_name)
-            )
-          `)
+          .select(`*, court:courts(*), proposal:proposals(*)`)
           .eq('proposal_id', id)
           .single();
 
         if (fetchError) throw fetchError;
         bookingData = data;
+        
+        // Fetch profiles separately if proposal exists
+        if (bookingData?.proposal) {
+          const proposal = bookingData.proposal;
+          const userIds = [proposal.from_user_id, proposal.to_user_id].filter(Boolean);
+          if (userIds.length > 0) {
+            const { data: profiles } = await supabase
+              .from('profiles')
+              .select('id, email, display_name')
+              .in('id', userIds);
+            
+            const profileMap = new Map((profiles || []).map(p => [p.id, p]));
+            bookingData.proposal = {
+              ...proposal,
+              from_user: profileMap.get(proposal.from_user_id) || null,
+              to_user: proposal.to_user_id ? (profileMap.get(proposal.to_user_id) || null) : null,
+            };
+          }
+        }
       } else {
         bookingData = await bookingsApi.get(id);
       }
@@ -109,6 +121,46 @@ export default function BookingDetailScreen() {
     } finally {
       setAddingToCalendar(false);
     }
+  };
+
+  const handleCancelMatch = () => {
+    if (!booking?.proposal) return;
+
+    const otherParticipant = getOtherParticipant();
+    const otherName = otherParticipant?.display_name || otherParticipant?.email || 'the other player';
+
+    Alert.alert(
+      'Cancel Match',
+      `Are you sure you want to cancel this match? ${otherName} will be notified.`,
+      [
+        { text: 'Keep Match', style: 'cancel' },
+        {
+          text: 'Cancel Match',
+          style: 'destructive',
+          onPress: async () => {
+            try {
+              setCancelling(true);
+              await proposalsApi.cancel(booking.proposal.id);
+              Alert.alert(
+                'Match Cancelled',
+                `The match has been cancelled. ${otherName} has been notified.`,
+                [
+                  {
+                    text: 'OK',
+                    onPress: () => router.back(),
+                  },
+                ]
+              );
+            } catch (err: any) {
+              console.error('Failed to cancel match:', err);
+              Alert.alert('Error', err.message || 'Failed to cancel match. Please try again.');
+            } finally {
+              setCancelling(false);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const getOtherParticipant = () => {
@@ -267,6 +319,23 @@ export default function BookingDetailScreen() {
             Event added to your calendar
           </Text>
         )}
+
+        {/* Cancel Match Button */}
+        <TouchableOpacity
+          style={[
+            styles.cancelButton,
+            { backgroundColor: colorScheme === 'dark' ? '#2a2a2a' : '#f0f0f0' },
+            cancelling && styles.cancelButtonDisabled,
+          ]}
+          onPress={handleCancelMatch}
+          disabled={cancelling}
+        >
+          {cancelling ? (
+            <ActivityIndicator size="small" color="#e53935" />
+          ) : (
+            <Text style={[styles.cancelButtonText, { color: '#e53935' }]}>Cancel Match</Text>
+          )}
+        </TouchableOpacity>
       </ScrollView>
     </SafeAreaView>
   );
@@ -384,5 +453,18 @@ const styles = StyleSheet.create({
   backLink: {
     fontSize: 16,
     fontWeight: '500',
+  },
+  cancelButton: {
+    paddingVertical: 16,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginTop: 16,
+  },
+  cancelButtonDisabled: {
+    opacity: 0.6,
+  },
+  cancelButtonText: {
+    fontSize: 17,
+    fontWeight: '600',
   },
 });

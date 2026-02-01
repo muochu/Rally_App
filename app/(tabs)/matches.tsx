@@ -1,21 +1,23 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useRouter } from 'expo-router';
+import { useCallback, useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  ScrollView,
-  RefreshControl,
-  ActivityIndicator,
+    ActivityIndicator,
+    Alert,
+    RefreshControl,
+    ScrollView,
+    StyleSheet,
+    Text,
+    TouchableOpacity,
+    View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
-import { useAuth } from '@/hooks/use-auth';
-import { Colors } from '@/constants/theme';
-import { proposalsApi } from '@/lib/supabase';
 import { SettingsModal } from '@/components/settings-modal';
-import type { Proposal } from '@/lib/types';
+import { Colors } from '@/constants/theme';
+import { useAuth } from '@/hooks/use-auth';
+import { useColorScheme } from '@/hooks/use-color-scheme';
+import { bookingsApi, proposalsApi } from '@/lib/supabase';
+import type { Booking, Proposal } from '@/lib/types';
 
 type Tab = 'pending' | 'upcoming' | 'past';
 
@@ -25,23 +27,43 @@ export default function MatchesScreen() {
   const isDark = colorScheme === 'dark';
   const { user } = useAuth();
   const userId = user?.id;
+  const router = useRouter();
 
   const [activeTab, setActiveTab] = useState<Tab>('pending');
   const [proposals, setProposals] = useState<Proposal[]>([]);
+  const [bookings, setBookings] = useState<Booking[]>([]);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [actionLoading, setActionLoading] = useState<string | null>(null);
 
   const loadMatches = useCallback(async () => {
     if (!userId) return;
     try {
-      const [received, sent] = await Promise.all([
-        proposalsApi.listReceived(userId),
-        proposalsApi.listSent(userId),
-      ]);
-      setProposals([...received, ...sent]);
-    } catch (e) {
-      console.error('Failed to load matches:', e);
+      // Load all proposals with user data included
+      const allProposals = await proposalsApi.listAll(userId);
+      setProposals(allProposals);
+
+      // Load bookings separately - fail gracefully
+      try {
+        const userBookings = await bookingsApi.listForUser(userId);
+        setBookings(userBookings);
+      } catch (bookingsErr) {
+        console.warn('[Matches] Failed to load bookings:', bookingsErr);
+        setBookings([]);
+      }
+    } catch (e: any) {
+      // NEVER swallow errors - always log full details
+      const errorMessage = e?.message || e?.toString() || 'Unknown error';
+      const errorCode = e?.code || 'no-code';
+      console.error('[Matches] Failed to load proposals:', {
+        code: errorCode,
+        message: errorMessage,
+        error: e,
+        userId,
+        stack: e?.stack,
+      });
+      // Could show error to user here if needed
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -57,10 +79,66 @@ export default function MatchesScreen() {
     loadMatches();
   };
 
-  const filterProposals = (tab: Tab) => {
+  const handleAccept = async (proposal: Proposal) => {
+    setActionLoading(proposal.id);
+    try {
+      const bookingId = await proposalsApi.accept(proposal.id);
+      Alert.alert('Match Confirmed!', 'The match has been added to your schedule.');
+      loadMatches();
+      router.push(`/booking/${bookingId}`);
+    } catch (e: any) {
+      Alert.alert('Error', e.message || 'Failed to accept proposal');
+    } finally {
+      setActionLoading(null);
+    }
+  };
+
+  const handleDecline = async (proposal: Proposal) => {
+    Alert.alert('Decline Match', 'Are you sure you want to decline this match?', [
+      { text: 'Cancel', style: 'cancel' },
+      {
+        text: 'Decline',
+        style: 'destructive',
+        onPress: async () => {
+          setActionLoading(proposal.id);
+          try {
+            await proposalsApi.decline(proposal.id);
+            loadMatches();
+          } catch (e) {
+            Alert.alert('Error', 'Failed to decline proposal');
+          } finally {
+            setActionLoading(null);
+          }
+        },
+      },
+    ]);
+  };
+
+  const handleCancel = async (proposal: Proposal) => {
+    Alert.alert('Cancel Match', 'Are you sure you want to cancel this match request?', [
+      { text: 'Keep', style: 'cancel' },
+      {
+        text: 'Cancel Match',
+        style: 'destructive',
+        onPress: async () => {
+          setActionLoading(proposal.id);
+          try {
+            await proposalsApi.cancel(proposal.id);
+            loadMatches();
+          } catch (e) {
+            Alert.alert('Error', 'Failed to cancel proposal');
+          } finally {
+            setActionLoading(null);
+          }
+        },
+      },
+    ]);
+  };
+
+  const filterProposals = (tab: Tab): Proposal[] => {
     const now = new Date();
     return proposals.filter((p) => {
-      const matchTime = new Date(p.proposed_start_utc);
+      const matchTime = new Date(p.start_ts_utc);
       if (tab === 'pending') {
         return p.status === 'pending';
       } else if (tab === 'upcoming') {
@@ -72,9 +150,16 @@ export default function MatchesScreen() {
   };
 
   const filtered = filterProposals(activeTab);
+  const pendingCount = proposals.filter((p) => p.status === 'pending').length;
+  const upcomingCount = proposals.filter((p) => {
+    const matchTime = new Date(p.start_ts_utc);
+    return p.status === 'accepted' && matchTime > new Date();
+  }).length;
 
   const formatMatch = (p: Proposal) => {
-    const date = new Date(p.proposed_start_utc);
+    const date = new Date(p.start_ts_utc);
+    const end = new Date(p.end_ts_utc);
+    const durationMins = Math.round((end.getTime() - date.getTime()) / 60000);
     return {
       date: date.toLocaleDateString(undefined, {
         weekday: 'short',
@@ -85,11 +170,16 @@ export default function MatchesScreen() {
         hour: 'numeric',
         minute: '2-digit',
       }),
+      duration: `${durationMins} min`,
       court: p.court?.name || 'TBD',
+      isIncoming: p.to_user_id === userId,
+      opponent: p.to_user_id === userId
+        ? (p.from_user?.display_name || p.from_user?.email?.split('@')[0] || 'Someone')
+        : (p.to_user?.display_name || p.to_user?.email?.split('@')[0] || 'Someone'),
     };
   };
 
-  const TabButton = ({ tab, label }: { tab: Tab; label: string }) => (
+  const TabButton = ({ tab, label, badge }: { tab: Tab; label: string; badge?: number }) => (
     <TouchableOpacity
       style={[
         styles.tabButton,
@@ -98,15 +188,22 @@ export default function MatchesScreen() {
       ]}
       onPress={() => setActiveTab(tab)}
     >
-      <Text
-        style={[
-          styles.tabButtonText,
-          { color: activeTab === tab ? colors.text : colors.icon },
-          activeTab === tab && styles.tabButtonTextActive,
-        ]}
-      >
-        {label}
-      </Text>
+      <View style={styles.tabContent}>
+        <Text
+          style={[
+            styles.tabButtonText,
+            { color: activeTab === tab ? colors.text : colors.icon },
+            activeTab === tab && styles.tabButtonTextActive,
+          ]}
+        >
+          {label}
+        </Text>
+        {badge !== undefined && badge > 0 && (
+          <View style={[styles.badge, { backgroundColor: '#e53935' }]}>
+            <Text style={styles.badgeText}>{badge}</Text>
+          </View>
+        )}
+      </View>
     </TouchableOpacity>
   );
 
@@ -130,11 +227,11 @@ export default function MatchesScreen() {
           <RefreshControl refreshing={refreshing} onRefresh={handleRefresh} />
         }
       >
-        {/* Header with Profile */}
+        {/* Header */}
         <View style={styles.headerRow}>
           <View style={styles.headerText}>
-            <Text style={[styles.title, { color: colors.text }]}>MY MATCHES</Text>
-            <Text style={[styles.subtitle, { color: colors.icon }]}>Manage your upcoming and past matches</Text>
+            <Text style={[styles.title, { color: colors.text }]}>Matches</Text>
+            <Text style={[styles.subtitle, { color: colors.icon }]}>Your tennis schedule</Text>
           </View>
           <TouchableOpacity
             style={[styles.profileButton, { backgroundColor: isDark ? '#2a2a2a' : '#f0f0f0' }]}
@@ -146,43 +243,103 @@ export default function MatchesScreen() {
 
         {/* Tabs */}
         <View style={[styles.tabContainer, { backgroundColor: isDark ? '#1a1a1a' : '#f0f0f0' }]}>
-          <TabButton tab="pending" label="Pending" />
-          <TabButton tab="upcoming" label="Upcoming" />
+          <TabButton tab="pending" label="Pending" badge={pendingCount} />
+          <TabButton tab="upcoming" label="Upcoming" badge={upcomingCount} />
           <TabButton tab="past" label="Past" />
         </View>
 
         {/* Content */}
         {filtered.length === 0 ? (
           <View style={[styles.emptyCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-            <Text style={styles.emptyIcon}>📅</Text>
-            <Text style={[styles.emptyText, { color: colors.icon }]}>
-              {activeTab === 'pending' && 'No pending matches. Start matchmaking or schedule a match!'}
-              {activeTab === 'upcoming' && 'No upcoming matches scheduled.'}
-              {activeTab === 'past' && 'No past matches yet.'}
+            <Text style={styles.emptyIcon}>
+              {activeTab === 'pending' ? '📬' : activeTab === 'upcoming' ? '🎾' : '📜'}
+            </Text>
+            <Text style={[styles.emptyText, { color: colors.text }]}>
+              {activeTab === 'pending' && 'No pending invites'}
+              {activeTab === 'upcoming' && 'No upcoming matches'}
+              {activeTab === 'past' && 'No past matches yet'}
+            </Text>
+            <Text style={[styles.emptyHint, { color: colors.icon }]}>
+              {activeTab === 'pending' && 'Send a match invite from the Find tab'}
+              {activeTab === 'upcoming' && 'Accept an invite or schedule a match'}
+              {activeTab === 'past' && 'Your completed matches will appear here'}
             </Text>
           </View>
         ) : (
           filtered.map((p) => {
-            const { date, time, court } = formatMatch(p);
+            const { date, time, duration, court, isIncoming, opponent } = formatMatch(p);
+            const isLoading = actionLoading === p.id;
+
             return (
               <View
                 key={p.id}
                 style={[styles.matchCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
               >
-                <View style={styles.matchInfo}>
-                  <Text style={[styles.matchDate, { color: colors.text }]}>{date}</Text>
-                  <Text style={[styles.matchTime, { color: colors.icon }]}>{time}</Text>
-                  <Text style={[styles.matchCourt, { color: colors.icon }]}>{court}</Text>
-                </View>
+                {/* Direction badge */}
                 {activeTab === 'pending' && (
+                  <View style={[styles.directionBadge, { backgroundColor: isIncoming ? '#4caf5020' : colors.tint + '20' }]}>
+                    <Text style={[styles.directionText, { color: isIncoming ? '#4caf50' : colors.tint }]}>
+                      {isIncoming ? 'Incoming' : 'Sent'}
+                    </Text>
+                  </View>
+                )}
+
+                <View style={styles.matchInfo}>
+                  <View style={styles.matchHeader}>
+                    <Text style={[styles.matchDate, { color: colors.text }]}>{date}</Text>
+                    <Text style={[styles.matchDuration, { color: colors.icon }]}>{duration}</Text>
+                  </View>
+                  <Text style={[styles.matchTime, { color: colors.icon }]}>{time}</Text>
+                  <Text style={[styles.matchCourt, { color: colors.tint }]}>{court}</Text>
+                  <Text style={[styles.matchOpponent, { color: colors.icon }]}>vs {opponent}</Text>
+                </View>
+
+                {/* Actions */}
+                {activeTab === 'pending' && isIncoming && (
                   <View style={styles.matchActions}>
-                    <TouchableOpacity style={[styles.actionBtn, styles.acceptBtn]}>
-                      <Text style={styles.acceptBtnText}>Accept</Text>
+                    <TouchableOpacity
+                      style={[styles.actionBtn, styles.acceptBtn]}
+                      onPress={() => handleAccept(p)}
+                      disabled={isLoading}
+                    >
+                      {isLoading ? (
+                        <ActivityIndicator size="small" color="#fff" />
+                      ) : (
+                        <Text style={styles.acceptBtnText}>Accept</Text>
+                      )}
                     </TouchableOpacity>
-                    <TouchableOpacity style={[styles.actionBtn, styles.declineBtn]}>
+                    <TouchableOpacity
+                      style={[styles.actionBtn, styles.declineBtn]}
+                      onPress={() => handleDecline(p)}
+                      disabled={isLoading}
+                    >
                       <Text style={styles.declineBtnText}>Decline</Text>
                     </TouchableOpacity>
                   </View>
+                )}
+
+                {activeTab === 'pending' && !isIncoming && (
+                  <View style={styles.matchActions}>
+                    <TouchableOpacity
+                      style={[styles.actionBtn, styles.cancelBtn]}
+                      onPress={() => handleCancel(p)}
+                      disabled={isLoading}
+                    >
+                      <Text style={styles.cancelBtnText}>Cancel</Text>
+                    </TouchableOpacity>
+                  </View>
+                )}
+
+                {activeTab === 'upcoming' && (
+                  <TouchableOpacity
+                    style={[styles.viewBtn, { backgroundColor: colors.tint }]}
+                    onPress={() => {
+                      const booking = bookings.find((b) => b.proposal_id === p.id);
+                      if (booking) router.push(`/booking/${booking.id}`);
+                    }}
+                  >
+                    <Text style={styles.viewBtnText}>View Details</Text>
+                  </TouchableOpacity>
                 )}
               </View>
             );
@@ -195,15 +352,21 @@ export default function MatchesScreen() {
 }
 
 const styles = StyleSheet.create({
+  container: { flex: 1 },
+  centered: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  scrollView: { flex: 1 },
+  content: { padding: 20, paddingBottom: 40 },
+
+  // Header
   headerRow: {
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'flex-start',
     marginBottom: 24,
   },
-  headerText: {
-    flex: 1,
-  },
+  headerText: { flex: 1 },
+  title: { fontSize: 28, fontWeight: '700' },
+  subtitle: { fontSize: 14, marginTop: 4 },
   profileButton: {
     width: 40,
     height: 40,
@@ -211,37 +374,14 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  profileIcon: {
-    fontSize: 18,
-  },
-  container: {
-    flex: 1,
-  },
-  centered: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  scrollView: {
-    flex: 1,
-  },
-  content: {
-    padding: 24,
-  },
-  title: {
-    fontSize: 32,
-    fontWeight: '900',
-    letterSpacing: 3,
-  },
-  subtitle: {
-    fontSize: 15,
-    marginTop: 4,
-  },
+  profileIcon: { fontSize: 18 },
+
+  // Tabs
   tabContainer: {
     flexDirection: 'row',
     borderRadius: 12,
     padding: 4,
-    marginBottom: 24,
+    marginBottom: 20,
   },
   tabButton: {
     flex: 1,
@@ -256,79 +396,79 @@ const styles = StyleSheet.create({
     shadowRadius: 2,
     elevation: 2,
   },
-  tabButtonText: {
-    fontSize: 14,
-    fontWeight: '500',
+  tabContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
   },
-  tabButtonTextActive: {
-    fontWeight: '600',
+  tabButtonText: { fontSize: 14, fontWeight: '500' },
+  tabButtonTextActive: { fontWeight: '600' },
+  badge: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 8,
+    minWidth: 18,
+    alignItems: 'center',
   },
+  badgeText: { color: '#fff', fontSize: 11, fontWeight: '700' },
+
+  // Empty state
   emptyCard: {
     padding: 40,
     borderRadius: 16,
     alignItems: 'center',
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.06,
-    shadowRadius: 8,
-    elevation: 2,
   },
-  emptyIcon: {
-    fontSize: 48,
-    marginBottom: 16,
-  },
-  emptyText: {
-    fontSize: 15,
-    textAlign: 'center',
-    lineHeight: 22,
-  },
+  emptyIcon: { fontSize: 48, marginBottom: 16 },
+  emptyText: { fontSize: 17, fontWeight: '600', marginBottom: 8 },
+  emptyHint: { fontSize: 14, textAlign: 'center', lineHeight: 20 },
+
+  // Match card
   matchCard: {
     padding: 16,
-    borderRadius: 12,
-    marginBottom: 12,
-    shadowColor: '#000',
-    shadowOffset: { width: 0, height: 1 },
-    shadowOpacity: 0.05,
-    shadowRadius: 4,
-    elevation: 1,
-  },
-  matchInfo: {
+    borderRadius: 14,
     marginBottom: 12,
   },
-  matchDate: {
-    fontSize: 16,
-    fontWeight: '600',
+  directionBadge: {
+    alignSelf: 'flex-start',
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    borderRadius: 8,
+    marginBottom: 10,
   },
-  matchTime: {
-    fontSize: 14,
-    marginTop: 2,
+  directionText: { fontSize: 12, fontWeight: '600' },
+  matchInfo: { marginBottom: 12 },
+  matchHeader: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
   },
-  matchCourt: {
-    fontSize: 14,
-    marginTop: 2,
-  },
+  matchDate: { fontSize: 16, fontWeight: '600' },
+  matchDuration: { fontSize: 12 },
+  matchTime: { fontSize: 14, marginTop: 2 },
+  matchCourt: { fontSize: 14, fontWeight: '500', marginTop: 6 },
+  matchOpponent: { fontSize: 13, marginTop: 4 },
+
+  // Actions
   matchActions: {
     flexDirection: 'row',
     gap: 10,
   },
   actionBtn: {
     flex: 1,
-    paddingVertical: 10,
-    borderRadius: 8,
+    paddingVertical: 12,
+    borderRadius: 10,
     alignItems: 'center',
   },
-  acceptBtn: {
-    backgroundColor: '#4caf50',
+  acceptBtn: { backgroundColor: '#4caf50' },
+  acceptBtnText: { color: '#fff', fontWeight: '600' },
+  declineBtn: { backgroundColor: 'rgba(229, 57, 53, 0.1)' },
+  declineBtnText: { color: '#e53935', fontWeight: '600' },
+  cancelBtn: { backgroundColor: 'rgba(158, 158, 158, 0.15)' },
+  cancelBtnText: { color: '#666', fontWeight: '600' },
+  viewBtn: {
+    paddingVertical: 12,
+    borderRadius: 10,
+    alignItems: 'center',
   },
-  acceptBtnText: {
-    color: '#fff',
-    fontWeight: '600',
-  },
-  declineBtn: {
-    backgroundColor: 'rgba(229, 57, 53, 0.1)',
-  },
-  declineBtnText: {
-    color: '#e53935',
-    fontWeight: '600',
-  },
+  viewBtnText: { color: '#fff', fontWeight: '600' },
 });

@@ -37,13 +37,6 @@ function parseCallbackUrl(url: string): ParsedCallback {
       errorDescription: get('error_description'),
     };
 
-    console.log('[Auth] Parsed callback:', {
-      hasAccessToken: !!parsed.accessToken,
-      hasRefreshToken: !!parsed.refreshToken,
-      hasProviderToken: !!parsed.providerToken,
-      hasProviderRefresh: !!parsed.providerRefreshToken,
-    });
-
     return parsed;
   } catch (err) {
     console.error('[Auth] Parse error:', err);
@@ -52,8 +45,6 @@ function parseCallbackUrl(url: string): ParsedCallback {
 }
 
 export async function handleAuthCallback(url: string): Promise<AuthCallbackResult> {
-  console.log('[Auth] Processing callback...');
-
   if (!url.includes('auth/callback')) {
     return { success: false, error: 'Not an auth callback URL' };
   }
@@ -80,14 +71,9 @@ export async function handleAuthCallback(url: string): Promise<AuthCallbackResul
   }
 
   const supabaseJwt = data.session.access_token;
-  console.log('[Auth] Session set for:', data.session.user?.email);
-  console.log('[Auth] JWT (first 20 chars):', supabaseJwt?.substring(0, 20));
-  console.log('[Auth] SUPABASE_URL:', SUPABASE_URL);
-  console.log('[Auth] ANON_KEY (first 20 chars):', SUPABASE_ANON_KEY?.substring(0, 20));
 
   // Store Google provider tokens if present
   if (parsed.providerToken && parsed.providerRefreshToken) {
-    console.log('[Auth] Saving Google tokens...');
 
     const expiresAt = new Date(Date.now() + (parsed.expiresIn ?? 3600) * 1000).toISOString();
 
@@ -107,13 +93,8 @@ export async function handleAuthCallback(url: string): Promise<AuthCallbackResul
         }),
       });
 
-      const text = await res.text();
-      console.log('[Auth] google-oauth-save response:', res.status, text);
-
       if (!res.ok) {
         console.warn('[Auth] google-oauth-save failed:', res.status);
-      } else {
-        console.log('[Auth] Google tokens saved successfully');
       }
     } catch (e) {
       console.warn('[Auth] google-oauth-save error:', e);
