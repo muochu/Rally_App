@@ -1,34 +1,38 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useFocusEffect } from '@react-navigation/native';
+import * as AuthSession from 'expo-auth-session';
+import * as WebBrowser from 'expo-web-browser';
+import { useCallback, useEffect, useState } from 'react';
 import {
-  View,
-  Text,
-  StyleSheet,
-  TouchableOpacity,
-  ScrollView,
-  Alert,
   ActivityIndicator,
-  RefreshControl,
+  Alert,
   Modal,
+  RefreshControl,
+  ScrollView,
+  StyleSheet,
+  Text,
+  TouchableOpacity,
+  View,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useRouter } from 'expo-router';
-import { useFocusEffect } from '@react-navigation/native';
 
-import { useColorScheme } from '@/hooks/use-color-scheme';
-import { useAuth } from '@/hooks/use-auth';
-import { Colors } from '@/constants/theme';
-import { availabilityApi, busyBlocksApi } from '@/lib/supabase';
+import { InlinePicker } from '@/components/inline-picker';
 import { SettingsModal } from '@/components/settings-modal';
+import { WeekRings } from '@/components/week-rings';
+import { Colors } from '@/constants/theme';
+import { useAuth } from '@/hooks/use-auth';
+import { useColorScheme } from '@/hooks/use-color-scheme';
+import { handleAuthCallback } from '@/lib/auth-callback';
+import {
+  getCalendarPermissionStatus,
+  requestCalendarPermission,
+  syncCalendarEvents,
+} from '@/lib/calendar';
+import { availabilityApi, busyBlocksApi, supabase, SUPABASE_ANON_KEY, SUPABASE_URL } from '@/lib/supabase';
 import type { AvailabilityWindow, BusyBlock } from '@/lib/types';
 
-type RecommendedSlot = {
-  start: Date;
-  end: Date;
-  label: string;
-  reason: string;
-};
-
 type TimeOfDay = 'morning' | 'noon' | 'afternoon' | 'evening';
+type WhenOption = 'today' | 'tomorrow' | 'weekdays' | 'weekends' | 'thisWeek';
+type TimeOfDayOption = 'morning' | 'midday' | 'afternoon' | 'evening' | 'anytime';
 
 const TIME_RANGES: Record<TimeOfDay, { start: number; end: number; label: string }> = {
   morning: { start: 6, end: 10, label: 'Morning (6a-10a)' },
@@ -37,18 +41,39 @@ const TIME_RANGES: Record<TimeOfDay, { start: number; end: number; label: string
   evening: { start: 17, end: 21, label: 'Evening (5p-9p)' },
 };
 
+const SCHEDULE_TIME_RANGES: Record<TimeOfDayOption, { start: number; end: number; label: string }> = {
+  morning: { start: 6, end: 10, label: 'Morning' },
+  midday: { start: 10, end: 13, label: 'Midday' },
+  afternoon: { start: 13, end: 17, label: 'Afternoon' },
+  evening: { start: 17, end: 21, label: 'Evening' },
+  anytime: { start: 6, end: 21, label: 'Anytime' },
+};
+
+const WHEN_OPTIONS = [
+  { label: 'Today', value: 'today' },
+  { label: 'Tomorrow', value: 'tomorrow' },
+  { label: 'This week', value: 'thisWeek' },
+  { label: 'Weekdays', value: 'weekdays' },
+  { label: 'Weekends', value: 'weekends' },
+];
+
+const TIME_OPTIONS = [
+  { label: 'Morning', value: 'morning' },
+  { label: 'Midday', value: 'midday' },
+  { label: 'Afternoon', value: 'afternoon' },
+  { label: 'Evening', value: 'evening' },
+  { label: 'Anytime', value: 'anytime' },
+];
+
 export default function AvailabilityScreen() {
   const colorScheme = useColorScheme() ?? 'light';
   const colors = Colors[colorScheme];
   const isDark = colorScheme === 'dark';
-  const { user, googleCalendarConnected } = useAuth();
+  const { user, session, googleCalendarConnected, refreshGoogleCalendarStatus } = useAuth();
   const userId = user?.id;
-  const router = useRouter();
 
   const [availability, setAvailability] = useState<AvailabilityWindow[]>([]);
   const [busyBlocks, setBusyBlocks] = useState<BusyBlock[]>([]);
-  const [recommendations, setRecommendations] = useState<RecommendedSlot[]>([]);
-  const [recOffset, setRecOffset] = useState(0);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
@@ -57,9 +82,20 @@ export default function AvailabilityScreen() {
   const [editTimeOfDay, setEditTimeOfDay] = useState<TimeOfDay>('morning');
 
   // Collapsible section states
-  const [showSuggested, setShowSuggested] = useState(true);
-  const [showAvailability, setShowAvailability] = useState(true);
+  const [showAvailability, setShowAvailability] = useState(false); // Collapsed - week rings shows summary
   const [showBusyBlocks, setShowBusyBlocks] = useState(false);
+  const [showRallyAhead, setShowRallyAhead] = useState(false);
+  const [showCalendarStatus, setShowCalendarStatus] = useState(false);
+
+  // Rally Ahead state
+  const [selectedWhen, setSelectedWhen] = useState<WhenOption>('today');
+  const [selectedTime, setSelectedTime] = useState<TimeOfDayOption>('evening');
+  const [addingSlot, setAddingSlot] = useState(false);
+
+  // Calendar sync state
+  const [appleCalendarSynced, setAppleCalendarSynced] = useState(false);
+  const [syncingGoogle, setSyncingGoogle] = useState(false);
+  const [syncingApple, setSyncingApple] = useState(false);
 
   const loadData = useCallback(async () => {
     if (!userId) return;
@@ -88,10 +124,6 @@ export default function AvailabilityScreen() {
 
       setAvailability(filteredAvail);
       setBusyBlocks(filteredBusy);
-
-      const recs = generateRecommendations(filteredBusy, filteredAvail);
-      setRecommendations(recs);
-      setRecOffset(0);
     } catch (e) {
       console.error('Failed to load:', e);
     } finally {
@@ -102,7 +134,13 @@ export default function AvailabilityScreen() {
 
   useEffect(() => {
     loadData();
+    checkAppleCalendar();
   }, [loadData]);
+
+  const checkAppleCalendar = async () => {
+    const status = await getCalendarPermissionStatus();
+    setAppleCalendarSynced(status === 'granted');
+  };
 
   useFocusEffect(
     useCallback(() => {
@@ -110,113 +148,6 @@ export default function AvailabilityScreen() {
     }, [loadData])
   );
 
-  const generateRecommendations = (busy: BusyBlock[], existing: AvailabilityWindow[]): RecommendedSlot[] => {
-    const recs: RecommendedSlot[] = [];
-    const now = new Date();
-    let lastRecEndHour = -1;
-    let lastRecDate = '';
-
-    for (let dayOffset = 0; dayOffset < 7; dayOffset++) {
-      const date = new Date(now);
-      date.setDate(date.getDate() + dayOffset);
-      date.setHours(0, 0, 0, 0);
-
-      const dayOfWeek = date.getDay();
-      const isWeekday = dayOfWeek >= 1 && dayOfWeek <= 5;
-      const dateKey = date.toDateString();
-
-      const dayStart = new Date(date);
-      const dayEnd = new Date(date);
-      dayEnd.setHours(23, 59, 59, 999);
-
-      const dayBusy = busy.filter((b) => {
-        const bStart = new Date(b.start_ts_utc);
-        const bEnd = new Date(b.end_ts_utc);
-        return bStart < dayEnd && bEnd > dayStart;
-      });
-
-      const dayAvail = existing.filter((a) => {
-        const aStart = new Date(a.start_ts_utc);
-        const aEnd = new Date(a.end_ts_utc);
-        return aStart < dayEnd && aEnd > dayStart;
-      });
-
-      const windows = isWeekday ? [
-        { start: 6, end: 10, label: 'Morning', reason: 'Before work' },
-        { start: 17, end: 21, label: 'Evening', reason: 'After work hours' },
-      ] : [
-        { start: 6, end: 10, label: 'Morning', reason: 'Weekend morning' },
-        { start: 10, end: 13, label: 'Noon', reason: 'Weekend midday' },
-        { start: 13, end: 17, label: 'Afternoon', reason: 'Weekend afternoon' },
-        { start: 17, end: 21, label: 'Evening', reason: 'Weekend evening' },
-      ];
-
-      for (const window of windows) {
-        const windowStart = new Date(date);
-        windowStart.setHours(window.start, 0, 0, 0);
-        const windowEnd = new Date(date);
-        windowEnd.setHours(window.end, 0, 0, 0);
-
-        if (windowEnd <= now) continue;
-        if (dateKey === lastRecDate && window.start <= lastRecEndHour) continue;
-
-        const effectiveStart = windowStart < now ? now : windowStart;
-
-        const isBusy = dayBusy.some((b) => {
-          const bStart = new Date(b.start_ts_utc);
-          const bEnd = new Date(b.end_ts_utc);
-          return bStart < windowEnd && bEnd > effectiveStart;
-        });
-
-        const hasAvail = dayAvail.some((a) => {
-          const aStart = new Date(a.start_ts_utc);
-          const aEnd = new Date(a.end_ts_utc);
-          return aStart < windowEnd && aEnd > effectiveStart;
-        });
-
-        if (!isBusy && !hasAvail) {
-          const dayLabel = dayOffset === 0 ? 'Today' : dayOffset === 1 ? 'Tomorrow' :
-            date.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-
-          let reason = window.reason;
-          const beforeBusy = dayBusy.find((b) => {
-            const bEnd = new Date(b.end_ts_utc);
-            return bEnd <= effectiveStart && bEnd.getTime() > effectiveStart.getTime() - 2 * 60 * 60 * 1000;
-          });
-          const afterBusy = dayBusy.find((b) => {
-            const bStart = new Date(b.start_ts_utc);
-            return bStart >= windowEnd && bStart.getTime() < windowEnd.getTime() + 2 * 60 * 60 * 1000;
-          });
-
-          if (beforeBusy && afterBusy) {
-            reason = 'Free between commitments';
-          } else if (afterBusy) {
-            reason = 'Before your next commitment';
-          } else if (beforeBusy) {
-            reason = 'After your last commitment';
-          }
-
-          recs.push({
-            start: effectiveStart,
-            end: windowEnd,
-            label: `${dayLabel} ${window.label}`,
-            reason,
-          });
-
-          lastRecEndHour = window.end;
-          lastRecDate = dateKey;
-
-          if (recs.length >= 9) return recs;
-        }
-      }
-
-      if (dateKey !== lastRecDate) {
-        lastRecEndHour = -1;
-      }
-    }
-
-    return recs;
-  };
 
   const handleRefresh = () => {
     setRefreshing(true);
@@ -242,28 +173,6 @@ export default function AvailabilityScreen() {
     ]);
   };
 
-  const handleAddRecommendation = async (rec: RecommendedSlot) => {
-    if (!userId) return;
-    const key = rec.start.toISOString();
-    setSavingSlot(key);
-    try {
-      const result = await availabilityApi.create({
-        user_id: userId,
-        start_ts_utc: rec.start.toISOString(),
-        end_ts_utc: rec.end.toISOString(),
-      });
-      if (result) {
-        setAvailability((prev) => [...prev, result].sort((a, b) =>
-          new Date(a.start_ts_utc).getTime() - new Date(b.start_ts_utc).getTime()
-        ));
-        setRecommendations((prev) => prev.filter((r) => r.start.toISOString() !== key));
-      }
-    } catch (e) {
-      Alert.alert('Error', 'Failed to add');
-    } finally {
-      setSavingSlot(null);
-    }
-  };
 
   const handleClearAll = () => {
     if (availability.length === 0) return;
@@ -355,6 +264,188 @@ export default function AvailabilityScreen() {
     return 'Evening';
   };
 
+  // Rally Ahead - schedule availability
+  const handleSchedule = async () => {
+    if (!userId) return;
+    setAddingSlot(true);
+    try {
+      const slots = getSlots(selectedWhen, selectedTime);
+      let added = 0;
+      for (const slot of slots) {
+        const result = await availabilityApi.create({
+          user_id: userId,
+          start_ts_utc: slot.start.toISOString(),
+          end_ts_utc: slot.end.toISOString(),
+        });
+        if (result) added++;
+      }
+      if (added > 0) {
+        Alert.alert('Added!', `${added} time slot${added !== 1 ? 's' : ''} added to your availability.`);
+        loadData();
+      } else {
+        Alert.alert('No changes', 'These times were already in your availability.');
+      }
+    } catch (e) {
+      Alert.alert('Error', 'Failed to schedule');
+    } finally {
+      setAddingSlot(false);
+    }
+  };
+
+  const getSlots = (when: WhenOption, time: TimeOfDayOption) => {
+    const slots: { start: Date; end: Date }[] = [];
+    const now = new Date();
+    const today = new Date(now);
+    today.setHours(0, 0, 0, 0);
+
+    const timeRanges = time === 'anytime'
+      ? (['morning', 'midday', 'afternoon', 'evening'] as TimeOfDayOption[])
+      : [time];
+
+    for (const t of timeRanges) {
+      const range = SCHEDULE_TIME_RANGES[t];
+
+      if (when === 'today') {
+        const start = new Date(today);
+        start.setHours(range.start, 0, 0, 0);
+        const end = new Date(today);
+        end.setHours(range.end, 0, 0, 0);
+        if (start > now) slots.push({ start, end });
+      } else if (when === 'tomorrow') {
+        const tomorrow = new Date(today);
+        tomorrow.setDate(tomorrow.getDate() + 1);
+        const start = new Date(tomorrow);
+        start.setHours(range.start, 0, 0, 0);
+        const end = new Date(tomorrow);
+        end.setHours(range.end, 0, 0, 0);
+        slots.push({ start, end });
+      } else if (when === 'thisWeek') {
+        for (let i = 0; i < 7; i++) {
+          const date = new Date(today);
+          date.setDate(today.getDate() + i);
+          const start = new Date(date);
+          start.setHours(range.start, 0, 0, 0);
+          const end = new Date(date);
+          end.setHours(range.end, 0, 0, 0);
+          if (start > now) slots.push({ start, end });
+        }
+      } else if (when === 'weekdays') {
+        for (let i = 0; i < 7; i++) {
+          const date = new Date(today);
+          date.setDate(today.getDate() + i);
+          const day = date.getDay();
+          if (day >= 1 && day <= 5) {
+            const start = new Date(date);
+            start.setHours(range.start, 0, 0, 0);
+            const end = new Date(date);
+            end.setHours(range.end, 0, 0, 0);
+            if (start > now) slots.push({ start, end });
+          }
+        }
+      } else if (when === 'weekends') {
+        for (let i = 0; i < 7; i++) {
+          const date = new Date(today);
+          date.setDate(today.getDate() + i);
+          const day = date.getDay();
+          if (day === 0 || day === 6) {
+            const start = new Date(date);
+            start.setHours(range.start, 0, 0, 0);
+            const end = new Date(date);
+            end.setHours(range.end, 0, 0, 0);
+            if (start > now) slots.push({ start, end });
+          }
+        }
+      }
+    }
+    return slots;
+  };
+
+  // Calendar sync functions
+  const syncGoogleCalendar = async () => {
+    if (!session?.access_token || syncingGoogle) return;
+    setSyncingGoogle(true);
+    try {
+      const res = await fetch(`${SUPABASE_URL}/functions/v1/google-calendar-sync`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          apikey: SUPABASE_ANON_KEY,
+          Authorization: `Bearer ${session.access_token}`,
+        },
+        body: JSON.stringify({ action: 'sync', horizonDays: 7 }),
+      });
+      const data = await res.json();
+      if (res.ok && data.synced !== undefined) {
+        Alert.alert('Synced', `Google Calendar synced${data.synced > 0 ? ` - ${data.synced} busy blocks` : ''}`);
+        loadData();
+      } else {
+        throw new Error(data.error || 'Sync failed');
+      }
+    } catch (e: any) {
+      Alert.alert('Error', 'Google sync failed');
+    } finally {
+      setSyncingGoogle(false);
+    }
+  };
+
+  const syncAppleCalendar = async () => {
+    if (!userId || syncingApple) return;
+    setSyncingApple(true);
+    try {
+      let permission = await getCalendarPermissionStatus();
+      if (permission !== 'granted') {
+        permission = await requestCalendarPermission();
+        if (permission !== 'granted') {
+          Alert.alert('Permission Required', 'Calendar access is needed.');
+          setSyncingApple(false);
+          return;
+        }
+      }
+      const blocks = await syncCalendarEvents();
+      await busyBlocksApi.upsertFromCalendar(userId, blocks);
+      setAppleCalendarSynced(true);
+      Alert.alert('Synced', `iCloud synced${blocks.length > 0 ? ` - ${blocks.length} busy blocks` : ''}`);
+      loadData();
+    } catch (e) {
+      Alert.alert('Error', 'iCloud sync failed');
+    } finally {
+      setSyncingApple(false);
+    }
+  };
+
+  const handleConnectGoogle = async () => {
+    try {
+      setAddingSlot(true);
+      let redirectUri = AuthSession.makeRedirectUri();
+      if (!redirectUri.includes('/auth/callback')) {
+        redirectUri = `${redirectUri}/auth/callback`;
+      }
+      const { data, error } = await supabase.auth.signInWithOAuth({
+        provider: 'google',
+        options: {
+          redirectTo: redirectUri,
+          skipBrowserRedirect: true,
+          scopes: 'openid email https://www.googleapis.com/auth/calendar.readonly',
+          queryParams: { access_type: 'offline', prompt: 'consent' },
+        },
+      });
+      if (error || !data?.url) throw error;
+      const result = await WebBrowser.openAuthSessionAsync(data.url, redirectUri);
+      const resultUrl = result.type === 'success' ? (result as { url?: string }).url : null;
+      if (result.type === 'success' && resultUrl) {
+        await handleAuthCallback(resultUrl);
+        setTimeout(() => {
+          refreshGoogleCalendarStatus();
+          syncGoogleCalendar();
+        }, 1000);
+      }
+    } catch (e) {
+      Alert.alert('Error', 'Failed to connect');
+    } finally {
+      setAddingSlot(false);
+    }
+  };
+
   if (loading) {
     return (
       <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
@@ -365,8 +456,6 @@ export default function AvailabilityScreen() {
     );
   }
 
-  const hasCalendarSync = googleCalendarConnected || busyBlocks.length > 0;
-  const visibleRecs = recommendations.slice(recOffset, recOffset + 3);
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: colors.background }]}>
@@ -390,73 +479,169 @@ export default function AvailabilityScreen() {
           </TouchableOpacity>
         </View>
 
-        {/* SECTION 1: Suggested Times (collapsible) */}
-        {hasCalendarSync && recommendations.length > 0 && (
-          <View style={styles.section}>
-            <TouchableOpacity
-              style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
-              onPress={() => setShowSuggested(!showSuggested)}
-              activeOpacity={0.7}
-            >
-              <View style={styles.sectionHeader}>
-                <View>
-                  <Text style={[styles.sectionTitle, { color: colors.text }]}>Suggested Times</Text>
-                  <Text style={[styles.sectionSubtitle, { color: colors.icon }]}>Based on your calendar</Text>
-                </View>
-                <View style={styles.sectionRight}>
-                  <View style={[styles.badge, { backgroundColor: '#4caf50' + '20' }]}>
-                    <Text style={[styles.badgeText, { color: '#4caf50' }]}>{recommendations.length}</Text>
-                  </View>
-                  <Text style={[styles.chevron, { color: colors.icon }]}>{showSuggested ? '▲' : '▼'}</Text>
-                </View>
-              </View>
-            </TouchableOpacity>
+        {/* Week Overview Rings */}
+        <View style={[styles.weekRingsCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+          <WeekRings availability={availability} onDeleteSlot={handleDelete} />
+        </View>
 
-            {showSuggested && (
-              <View style={[styles.sectionContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
-                {visibleRecs.map((rec, idx) => (
+        {/* Rally Ahead Section - Quick Add Availability */}
+        <View style={styles.section}>
+          <TouchableOpacity
+            style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+            onPress={() => setShowRallyAhead(!showRallyAhead)}
+            activeOpacity={0.7}
+          >
+            <View style={styles.sectionHeader}>
+              <View>
+                <Text style={[styles.sectionTitle, { color: colors.text }]}>Rally Ahead</Text>
+                <Text style={[styles.sectionSubtitle, { color: colors.icon }]}>Quickly add availability</Text>
+              </View>
+              <View style={styles.sectionRight}>
+                <Text style={[styles.chevron, { color: colors.icon }]}>{showRallyAhead ? '▲' : '▼'}</Text>
+              </View>
+            </View>
+          </TouchableOpacity>
+
+          {showRallyAhead && (
+            <View style={[styles.sectionContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+              <View style={styles.rallyAheadRow}>
+                <Text style={[styles.rallyAheadLabel, { color: colors.text }]}>I&apos;m free</Text>
+                <InlinePicker
+                  label=""
+                  options={WHEN_OPTIONS}
+                  selectedValue={selectedWhen}
+                  onValueChange={(v) => setSelectedWhen(v as WhenOption)}
+                />
+              </View>
+              <View style={styles.rallyAheadRow}>
+                <Text style={[styles.rallyAheadLabel, { color: colors.text }]}>in the</Text>
+                <InlinePicker
+                  label=""
+                  options={TIME_OPTIONS}
+                  selectedValue={selectedTime}
+                  onValueChange={(v) => setSelectedTime(v as TimeOfDayOption)}
+                />
+              </View>
+              <TouchableOpacity
+                style={[styles.addSlotButton, { backgroundColor: colors.tint }]}
+                onPress={handleSchedule}
+                disabled={addingSlot}
+              >
+                {addingSlot ? (
+                  <ActivityIndicator size="small" color="#fff" />
+                ) : (
+                  <Text style={styles.addSlotButtonText}>+ Add to Availability</Text>
+                )}
+              </TouchableOpacity>
+            </View>
+          )}
+        </View>
+
+        {/* Calendar Status Section */}
+        <View style={styles.section}>
+          <TouchableOpacity
+            style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
+            onPress={() => setShowCalendarStatus(!showCalendarStatus)}
+            activeOpacity={0.7}
+          >
+            <View style={styles.sectionHeader}>
+              <View>
+                <Text style={[styles.sectionTitle, { color: colors.text }]}>Calendar Sync</Text>
+                <Text style={[styles.sectionSubtitle, { color: colors.icon }]}>
+                  {googleCalendarConnected || appleCalendarSynced
+                    ? 'Syncing automatically'
+                    : 'Connect your calendars'}
+                </Text>
+              </View>
+              <View style={styles.sectionRight}>
+                {(googleCalendarConnected || appleCalendarSynced) && (
+                  <View style={[styles.badge, { backgroundColor: '#4caf50' + '20' }]}>
+                    <Text style={[styles.badgeText, { color: '#4caf50' }]}>
+                      {(googleCalendarConnected ? 1 : 0) + (appleCalendarSynced ? 1 : 0)}
+                    </Text>
+                  </View>
+                )}
+                <Text style={[styles.chevron, { color: colors.icon }]}>{showCalendarStatus ? '▲' : '▼'}</Text>
+              </View>
+            </View>
+          </TouchableOpacity>
+
+          {showCalendarStatus && (
+            <View style={[styles.sectionContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+              {/* Google Calendar */}
+              <View style={[styles.calendarRow, { borderBottomWidth: 1, borderBottomColor: isDark ? '#333' : '#f0f0f0' }]}>
+                <View style={styles.calendarInfo}>
+                  <View style={styles.calendarHeader}>
+                    <Text style={[styles.calendarName, { color: colors.text }]}>Google Calendar</Text>
+                    {googleCalendarConnected && (
+                      <View style={[styles.statusDot, { backgroundColor: '#4caf50' }]} />
+                    )}
+                  </View>
+                  <Text style={[styles.calendarStatus, { color: colors.icon }]}>
+                    {googleCalendarConnected ? 'Connected' : 'Not connected'}
+                  </Text>
+                </View>
+                {googleCalendarConnected ? (
                   <TouchableOpacity
-                    key={rec.start.toISOString()}
-                    style={[
-                      styles.recRow,
-                      idx < visibleRecs.length - 1 && { borderBottomWidth: 1, borderBottomColor: isDark ? '#333' : '#f0f0f0' },
-                    ]}
-                    onPress={() => handleAddRecommendation(rec)}
-                    disabled={savingSlot === rec.start.toISOString()}
+                    style={[styles.syncBtn, { backgroundColor: isDark ? '#333' : '#f0f0f0' }]}
+                    onPress={syncGoogleCalendar}
+                    disabled={syncingGoogle}
                   >
-                    <View style={styles.recInfo}>
-                      <Text style={[styles.recLabel, { color: colors.text }]}>{rec.label}</Text>
-                      <Text style={[styles.recTime, { color: colors.icon }]}>
-                        {rec.start.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })} – {rec.end.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}
-                      </Text>
-                      <Text style={[styles.recReason, { color: '#4caf50' }]}>{rec.reason}</Text>
-                    </View>
-                    {savingSlot === rec.start.toISOString() ? (
-                      <ActivityIndicator size="small" color="#4caf50" />
+                    {syncingGoogle ? (
+                      <ActivityIndicator size="small" color={colors.tint} />
                     ) : (
-                      <View style={[styles.addBtnSmall, { backgroundColor: '#4caf50' }]}>
-                        <Text style={styles.addBtnSmallText}>Add</Text>
-                      </View>
+                      <Text style={[styles.syncBtnText, { color: colors.tint }]}>Sync</Text>
                     )}
                   </TouchableOpacity>
-                ))}
-
-                {recommendations.length > 3 && (
+                ) : (
                   <TouchableOpacity
-                    style={styles.showMoreRow}
-                    onPress={() => setRecOffset((prev) => (prev + 3 >= recommendations.length ? 0 : prev + 3))}
+                    style={[styles.connectBtn, { backgroundColor: colors.tint }]}
+                    onPress={handleConnectGoogle}
                   >
-                    <Text style={[styles.showMoreText, { color: colors.tint }]}>
-                      {recOffset + 3 >= recommendations.length ? 'Show first 3' : `Show more →`}
-                    </Text>
+                    <Text style={styles.connectBtnText}>Connect</Text>
                   </TouchableOpacity>
                 )}
               </View>
-            )}
-          </View>
-        )}
 
-        {/* SECTION 2: Your Availability (collapsible) */}
+              {/* Apple Calendar */}
+              <View style={styles.calendarRow}>
+                <View style={styles.calendarInfo}>
+                  <View style={styles.calendarHeader}>
+                    <Text style={[styles.calendarName, { color: colors.text }]}>iCloud Calendar</Text>
+                    {appleCalendarSynced && (
+                      <View style={[styles.statusDot, { backgroundColor: '#4caf50' }]} />
+                    )}
+                  </View>
+                  <Text style={[styles.calendarStatus, { color: colors.icon }]}>
+                    {appleCalendarSynced ? 'Connected' : 'Not connected'}
+                  </Text>
+                </View>
+                {appleCalendarSynced ? (
+                  <TouchableOpacity
+                    style={[styles.syncBtn, { backgroundColor: isDark ? '#333' : '#f0f0f0' }]}
+                    onPress={syncAppleCalendar}
+                    disabled={syncingApple}
+                  >
+                    {syncingApple ? (
+                      <ActivityIndicator size="small" color={colors.tint} />
+                    ) : (
+                      <Text style={[styles.syncBtnText, { color: colors.tint }]}>Sync</Text>
+                    )}
+                  </TouchableOpacity>
+                ) : (
+                  <TouchableOpacity
+                    style={[styles.connectBtn, { backgroundColor: colors.tint }]}
+                    onPress={syncAppleCalendar}
+                  >
+                    <Text style={styles.connectBtnText}>Connect</Text>
+                  </TouchableOpacity>
+                )}
+              </View>
+            </View>
+          )}
+        </View>
+
+        {/* Your Availability (collapsible) */}
         <View style={styles.section}>
           <TouchableOpacity
             style={[styles.sectionCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}
@@ -484,7 +669,7 @@ export default function AvailabilityScreen() {
                   <Text style={styles.emptyIcon}>📅</Text>
                   <Text style={[styles.emptyText, { color: colors.text }]}>No availability set</Text>
                   <Text style={[styles.emptyHint, { color: colors.icon }]}>
-                    {hasCalendarSync ? 'Add a suggested time above' : 'Set when you can play from the home tab'}
+                    Set when you can play using Rally Ahead above
                   </Text>
                 </View>
               ) : (
@@ -528,15 +713,7 @@ export default function AvailabilityScreen() {
           )}
         </View>
 
-        {/* Add Availability Button */}
-        <TouchableOpacity
-          style={[styles.addButton, { backgroundColor: colors.tint }]}
-          onPress={() => router.push('/')}
-        >
-          <Text style={styles.addButtonText}>+ Add Availability</Text>
-        </TouchableOpacity>
-
-        {/* SECTION 3: Calendar Busy Times (collapsible, collapsed by default) */}
+        {/* Calendar Busy Times (collapsible, collapsed by default) */}
         {busyBlocks.length > 0 && (
           <View style={styles.section}>
             <TouchableOpacity
@@ -699,6 +876,13 @@ const styles = StyleSheet.create({
   },
   profileIcon: { fontSize: 18 },
 
+  // Week Rings Card
+  weekRingsCard: {
+    borderRadius: 16,
+    padding: 16,
+    marginBottom: 20,
+  },
+
   // Sections
   section: { marginBottom: 16 },
   sectionCard: {
@@ -793,14 +977,78 @@ const styles = StyleSheet.create({
   emptyText: { fontSize: 16, fontWeight: '600', marginBottom: 6 },
   emptyHint: { fontSize: 13, textAlign: 'center' },
 
-  // Add button
-  addButton: {
-    paddingVertical: 16,
-    borderRadius: 14,
+  // Rally Ahead
+  rallyAheadRow: {
+    flexDirection: 'row',
     alignItems: 'center',
-    marginBottom: 16,
+    marginVertical: 6,
   },
-  addButtonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
+  rallyAheadLabel: {
+    fontSize: 18,
+    fontWeight: '400',
+    marginRight: 8,
+  },
+  addSlotButton: {
+    paddingVertical: 14,
+    borderRadius: 12,
+    alignItems: 'center',
+    marginTop: 12,
+    marginBottom: 8,
+  },
+  addSlotButtonText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+  },
+
+  // Calendar Status
+  calendarRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 14,
+  },
+  calendarInfo: {
+    flex: 1,
+  },
+  calendarHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+  },
+  calendarName: {
+    fontSize: 15,
+    fontWeight: '500',
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+  },
+  calendarStatus: {
+    fontSize: 12,
+    marginTop: 2,
+  },
+  syncBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 14,
+    minWidth: 60,
+    alignItems: 'center',
+  },
+  syncBtnText: {
+    fontSize: 13,
+    fontWeight: '600',
+  },
+  connectBtn: {
+    paddingHorizontal: 16,
+    paddingVertical: 8,
+    borderRadius: 14,
+  },
+  connectBtnText: {
+    color: '#fff',
+    fontSize: 13,
+    fontWeight: '600',
+  },
 
   // Busy blocks
   busyRow: {

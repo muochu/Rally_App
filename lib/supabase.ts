@@ -297,6 +297,41 @@ export const proposalsApi = {
 
     if (error) throw error;
   },
+
+  /**
+   * Get ongoing matches (matches that are currently happening)
+   */
+  async listOngoing(userId: string): Promise<Proposal[]> {
+    const now = new Date().toISOString();
+    const { data, error } = await supabase
+      .from('proposals')
+      .select(`*, court:courts(*)`)
+      .eq('status', 'accepted')
+      .or(`from_user_id.eq.${userId},to_user_id.eq.${userId}`)
+      .lte('start_ts_utc', now)
+      .gt('end_ts_utc', now)
+      .order('start_ts_utc', { ascending: true });
+
+    if (error) throw error;
+    if (!data || data.length === 0) return [];
+
+    // Fetch all related profiles
+    const fromUserIds = [...new Set(data.map(p => p.from_user_id))];
+    const toUserIds = [...new Set(data.map(p => p.to_user_id).filter(Boolean))];
+    const allUserIds = [...new Set([...fromUserIds, ...toUserIds])];
+
+    const { data: profiles } = await supabase
+      .from('profiles')
+      .select('id, email, display_name')
+      .in('id', allUserIds);
+
+    const profileMap = new Map((profiles || []).map(p => [p.id, p]));
+    return data.map(p => ({
+      ...p,
+      from_user: profileMap.get(p.from_user_id) || null,
+      to_user: p.to_user_id ? (profileMap.get(p.to_user_id) || null) : null,
+    }));
+  },
 };
 
 /**
@@ -1260,5 +1295,98 @@ export const matchInvitesApi = {
       return null;
     }
     return data;
+  },
+};
+
+/**
+ * Match Attendance API
+ * Track when users confirm they're at a match
+ */
+export const matchAttendanceApi = {
+  /**
+   * Confirm that a user is at the match
+   */
+  async confirmAttendance(proposalId: string, userId: string): Promise<void> {
+    const { error } = await supabase
+      .from('match_attendance')
+      .insert({
+        proposal_id: proposalId,
+        user_id: userId,
+      })
+      .select()
+      .single();
+
+    if (error) {
+      // Ignore duplicate errors (user already confirmed)
+      if (error.code === '23505') {
+        // User already confirmed, that's fine
+        return;
+      }
+      
+      // Check if table doesn't exist (migration not run)
+      if (error.code === 'PGRST205' || error.message?.includes('does not exist') || error.message?.includes('schema cache')) {
+        // Silently return - feature not available yet, don't show error to user
+        // Only log once to avoid spam
+        if (!(global as any).__matchAttendanceTableWarned) {
+          console.warn('[MatchAttendance] Table does not exist - migration may not be run. Attendance feature disabled.');
+          (global as any).__matchAttendanceTableWarned = true;
+        }
+        return;
+      }
+      
+      console.error('[MatchAttendance] Confirm failed:', {
+        code: error.code,
+        message: error.message,
+        details: error.details,
+        hint: error.hint,
+      });
+      throw error;
+    }
+  },
+
+  /**
+   * Check if a user has confirmed attendance for a proposal
+   */
+  async hasConfirmed(proposalId: string, userId: string): Promise<boolean> {
+    try {
+      const { data, error } = await supabase
+        .from('match_attendance')
+        .select('id')
+        .eq('proposal_id', proposalId)
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (error) {
+        // If table doesn't exist, just return false (feature not available)
+        if (error.code === 'PGRST205' || error.message?.includes('does not exist') || error.message?.includes('schema cache')) {
+          // Already warned in confirmAttendance, no need to warn again
+          return false;
+        }
+        console.error('[MatchAttendance] Check failed:', error.code, error.message);
+        return false;
+      }
+      return !!data;
+    } catch (err: any) {
+      // Handle any unexpected errors gracefully
+      console.warn('[MatchAttendance] Check error:', err);
+      return false;
+    }
+  },
+
+  /**
+   * Get all attendance confirmations for a proposal
+   */
+  async getForProposal(proposalId: string): Promise<{ user_id: string; confirmed_at: string }[]> {
+    const { data, error } = await supabase
+      .from('match_attendance')
+      .select('user_id, confirmed_at')
+      .eq('proposal_id', proposalId)
+      .order('confirmed_at', { ascending: true });
+
+    if (error) {
+      console.error('[MatchAttendance] Get failed:', error.code, error.message);
+      return [];
+    }
+    return data || [];
   },
 };

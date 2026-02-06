@@ -12,11 +12,12 @@ import {
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 
+import { MatchAttendanceModal } from '@/components/match-attendance-modal';
 import { SettingsModal } from '@/components/settings-modal';
 import { Colors } from '@/constants/theme';
 import { useAuth } from '@/hooks/use-auth';
 import { useColorScheme } from '@/hooks/use-color-scheme';
-import { bookingsApi, proposalsApi } from '@/lib/supabase';
+import { bookingsApi, matchAttendanceApi, proposalsApi } from '@/lib/supabase';
 import type { Booking, Proposal } from '@/lib/types';
 
 type Tab = 'pending' | 'upcoming' | 'past';
@@ -36,13 +37,25 @@ export default function MatchesScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
+  const [showAttendanceModal, setShowAttendanceModal] = useState(false);
+  const [currentMatchProposal, setCurrentMatchProposal] = useState<Proposal | null>(null);
+  const [attendanceChecked, setAttendanceChecked] = useState<Set<string>>(new Set());
 
   const loadMatches = useCallback(async () => {
     if (!userId) return;
     try {
       // Load all proposals with user data included
       const allProposals = await proposalsApi.listAll(userId);
-      setProposals(allProposals);
+      // Also load ongoing matches to ensure they're included
+      const ongoing = await proposalsApi.listOngoing(userId);
+      // Merge and deduplicate
+      const proposalMap = new Map<string, Proposal>();
+      [...allProposals, ...ongoing].forEach(p => {
+        if (!proposalMap.has(p.id)) {
+          proposalMap.set(p.id, p);
+        }
+      });
+      setProposals(Array.from(proposalMap.values()));
 
       // Load bookings separately - fail gracefully
       try {
@@ -73,6 +86,62 @@ export default function MatchesScreen() {
   useEffect(() => {
     loadMatches();
   }, [loadMatches]);
+
+  // Check for match-time notifications
+  useEffect(() => {
+    if (!userId) return;
+
+    const checkMatchNotifications = async () => {
+      try {
+        const ongoing = await proposalsApi.listOngoing(userId);
+        const now = new Date();
+        const oneMinuteAgo = new Date(now.getTime() - 60 * 1000);
+        const oneMinuteFromNow = new Date(now.getTime() + 60 * 1000);
+
+        for (const match of ongoing) {
+          const matchStart = new Date(match.start_ts_utc);
+          const matchId = match.id;
+
+          if (
+            matchStart >= oneMinuteAgo &&
+            matchStart <= oneMinuteFromNow &&
+            !attendanceChecked.has(matchId)
+          ) {
+            const hasConfirmed = await matchAttendanceApi.hasConfirmed(matchId, userId);
+            if (!hasConfirmed) {
+              setCurrentMatchProposal(match);
+              setShowAttendanceModal(true);
+              setAttendanceChecked(prev => new Set(prev).add(matchId));
+            }
+          }
+        }
+      } catch (err) {
+        console.error('Failed to check match notifications:', err);
+      }
+    };
+
+    checkMatchNotifications();
+    const interval = setInterval(checkMatchNotifications, 30000);
+    return () => clearInterval(interval);
+  }, [userId, attendanceChecked]);
+
+  const handleConfirmAttendance = async () => {
+    if (!currentMatchProposal || !userId) return;
+    
+    try {
+      await matchAttendanceApi.confirmAttendance(currentMatchProposal.id, userId);
+      setShowAttendanceModal(false);
+      loadMatches(); // Refresh matches
+    } catch (err: any) {
+      console.error('Failed to confirm attendance:', err);
+      const errorMessage = err?.message || 'Failed to confirm attendance. Please try again.';
+      Alert.alert('Error', errorMessage);
+    }
+  };
+
+  const handleDismissAttendance = () => {
+    setShowAttendanceModal(false);
+  };
 
   const handleRefresh = () => {
     setRefreshing(true);
@@ -138,16 +207,29 @@ export default function MatchesScreen() {
   const filterProposals = (tab: Tab): Proposal[] => {
     const now = new Date();
     return proposals.filter((p) => {
-      const matchTime = new Date(p.start_ts_utc);
+      const matchStart = new Date(p.start_ts_utc);
+      const matchEnd = new Date(p.end_ts_utc);
+      const isOngoing = p.status === 'accepted' && matchStart <= now && matchEnd > now;
+      
       if (tab === 'pending') {
         return p.status === 'pending';
       } else if (tab === 'upcoming') {
-        return p.status === 'accepted' && matchTime > now;
+        return p.status === 'accepted' && matchStart > now;
       } else {
-        return p.status === 'accepted' && matchTime <= now;
+        // Past tab: show both past matches and ongoing matches
+        return p.status === 'accepted' && (matchEnd <= now || isOngoing);
       }
     });
   };
+
+  // Get ongoing matches separately for banner
+  const ongoingMatches = proposals.filter((p) => {
+    if (p.status !== 'accepted') return false;
+    const matchStart = new Date(p.start_ts_utc);
+    const matchEnd = new Date(p.end_ts_utc);
+    const now = new Date();
+    return matchStart <= now && matchEnd > now;
+  });
 
   const filtered = filterProposals(activeTab);
   const pendingCount = proposals.filter((p) => p.status === 'pending').length;
@@ -248,6 +330,42 @@ export default function MatchesScreen() {
           <TabButton tab="past" label="Past" />
         </View>
 
+        {/* Ongoing Match Banner (Past Tab) */}
+        {activeTab === 'past' && ongoingMatches.length > 0 && (
+          <View style={[styles.ongoingBanner, { backgroundColor: '#4caf50' }]}>
+            <Text style={styles.ongoingBannerTitle}>🎾 Match in Progress</Text>
+            {ongoingMatches.map((match) => {
+              const { date, time, duration, court, opponent } = formatMatch(match);
+              const startTime = new Date(match.start_ts_utc);
+              const endTime = new Date(match.end_ts_utc);
+              const now = new Date();
+              const elapsed = Math.round((now.getTime() - startTime.getTime()) / (1000 * 60));
+              const remaining = Math.round((endTime.getTime() - now.getTime()) / (1000 * 60));
+
+              return (
+                <TouchableOpacity
+                  key={match.id}
+                  style={styles.ongoingBannerContent}
+                  onPress={() => {
+                    const booking = bookings.find((b) => b.proposal_id === match.id);
+                    if (booking) router.push(`/booking/${booking.id}`);
+                  }}
+                >
+                  <View style={styles.ongoingBannerInfo}>
+                    <Text style={styles.ongoingBannerText}>
+                      {date} • {time} • vs {opponent}
+                    </Text>
+                    <Text style={styles.ongoingBannerTime}>
+                      {elapsed} min elapsed • {remaining} min remaining
+                    </Text>
+                  </View>
+                  <Text style={styles.ongoingBannerArrow}>→</Text>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        )}
+
         {/* Content */}
         {filtered.length === 0 ? (
           <View style={[styles.emptyCard, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
@@ -347,6 +465,12 @@ export default function MatchesScreen() {
         )}
       </ScrollView>
       <SettingsModal visible={showSettings} onClose={() => setShowSettings(false)} />
+      <MatchAttendanceModal
+        visible={showAttendanceModal}
+        proposal={currentMatchProposal}
+        onConfirm={handleConfirmAttendance}
+        onDismiss={handleDismissAttendance}
+      />
     </SafeAreaView>
   );
 }
@@ -471,4 +595,46 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   viewBtnText: { color: '#fff', fontWeight: '600' },
+  ongoingBanner: {
+    borderRadius: 14,
+    padding: 16,
+    marginBottom: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    elevation: 3,
+  },
+  ongoingBannerTitle: {
+    color: '#fff',
+    fontSize: 16,
+    fontWeight: '700',
+    marginBottom: 12,
+  },
+  ongoingBannerContent: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingVertical: 8,
+  },
+  ongoingBannerInfo: {
+    flex: 1,
+  },
+  ongoingBannerText: {
+    color: '#fff',
+    fontSize: 15,
+    fontWeight: '600',
+    marginBottom: 4,
+  },
+  ongoingBannerTime: {
+    color: '#fff',
+    fontSize: 13,
+    opacity: 0.9,
+  },
+  ongoingBannerArrow: {
+    color: '#fff',
+    fontSize: 20,
+    fontWeight: '600',
+    marginLeft: 12,
+  },
 });

@@ -1,3 +1,4 @@
+import * as AuthSession from 'expo-auth-session';
 import * as WebBrowser from 'expo-web-browser';
 import { useState } from 'react';
 import {
@@ -35,11 +36,8 @@ import { authApi, supabase } from '@/lib/supabase';
  * - Google Cloud Console: Add authorized redirect URI:
  *   https://<PROJECT_REF>.supabase.co/auth/v1/callback
  * - Supabase Dashboard (Authentication > URL Configuration):
- *   Add allowed redirect URL: rallyapp://auth/callback
+ *   Add allowed redirect URL: rallyapp://auth/callback (or Expo proxy URL for Expo Go)
  */
-
-// App deep link scheme for OAuth callback
-const REDIRECT_URL = 'rallyapp://auth/callback';
 
 export default function LoginScreen() {
   const colorScheme = useColorScheme() ?? 'light';
@@ -56,17 +54,32 @@ export default function LoginScreen() {
     setGoogleLoading(true);
 
     try {
+      // Use explicit redirect URI to avoid path issues
+      // makeRedirectUri() can return "rallyapp://" which when appended with "/auth/callback"
+      // becomes "rallyapp:///auth/callback" (triple slash) - Supabase doesn't like this
+      const redirectUri = 'rallyapp://auth/callback';
+      
+      // Structured logging (single-line JSON, no secrets)
+      console.log(JSON.stringify({
+        event: 'oauth_start',
+        platform: Platform.OS,
+        redirectUri: redirectUri,
+        timestamp: new Date().toISOString(),
+      }));
+      
       // Start Supabase OAuth flow
+      // TODO: Re-enable calendar scope after basic auth is working
       const { data, error: oauthError } = await supabase.auth.signInWithOAuth({
         provider: 'google',
         options: {
-          redirectTo: REDIRECT_URL,
+          redirectTo: redirectUri,
           skipBrowserRedirect: true,
-          scopes: 'https://www.googleapis.com/auth/calendar.readonly',
-          queryParams: {
-            access_type: 'offline',
-            prompt: 'consent',
-          },
+          // Temporarily disabled to test basic auth:
+          // scopes: 'https://www.googleapis.com/auth/calendar.readonly',
+          // queryParams: {
+          //   access_type: 'offline',
+          //   prompt: 'consent',
+          // },
         },
       });
 
@@ -78,32 +91,74 @@ export default function LoginScreen() {
         throw new Error('No OAuth URL returned from Supabase');
       }
 
+      // Extract redirect_to from auth URL for verification
+      let redirectToInUrl: string | null = null;
+      try {
+        const authUrlObj = new URL(data.url);
+        redirectToInUrl = authUrlObj.searchParams.get('redirect_to');
+      } catch {
+        redirectToInUrl = null;
+      }
+      
+      // Structured logging (single-line JSON, no secrets)
+      console.log(JSON.stringify({
+        event: 'oauth_url_generated',
+        platform: Platform.OS,
+        redirectUri: redirectUri,
+        redirectToInUrl: redirectToInUrl,
+        authUrlLength: data.url.length,
+        timestamp: new Date().toISOString(),
+      }));
+
       console.log('[Login] Opening OAuth URL...');
 
       // Open the OAuth URL in a browser session
       // This will return when the browser redirects back to our app
       const result = await WebBrowser.openAuthSessionAsync(
         data.url,
-        REDIRECT_URL
+        redirectUri
       );
 
-      console.log('[Login] WebBrowser result type:', result.type);
+      // Structured logging for WebBrowser result
+      const resultUrl = result.type === 'success' ? (result as { url?: string }).url : null;
+      console.log(JSON.stringify({
+        event: 'oauth_browser_result',
+        platform: Platform.OS,
+        resultType: result.type,
+        hasUrl: !!resultUrl,
+        timestamp: new Date().toISOString(),
+      }));
 
-      if (result.type === 'success' && result.url) {
+      if (result.type === 'success' && resultUrl) {
         // Browser returned with a URL - parse and set session
-        console.log('[Login] Processing callback URL...');
-        const callbackResult = await handleAuthCallback(result.url);
+        const callbackResult = await handleAuthCallback(resultUrl);
+        
+        // Structured logging for callback result
+        console.log(JSON.stringify({
+          event: 'oauth_callback_processed',
+          platform: Platform.OS,
+          success: callbackResult.success,
+          error: callbackResult.error || null,
+          timestamp: new Date().toISOString(),
+        }));
 
         if (!callbackResult.success) {
           setError(callbackResult.error || 'Sign-in failed. Please try again.');
         }
         // Success: useAuth hook will detect the session change
       } else if (result.type === 'cancel' || result.type === 'dismiss') {
-        // User cancelled the flow
-        console.log('[Login] User cancelled OAuth flow');
+        console.log(JSON.stringify({
+          event: 'oauth_cancelled',
+          platform: Platform.OS,
+          timestamp: new Date().toISOString(),
+        }));
       } else {
-        // Unexpected result type
-        console.log('[Login] Unexpected result:', result);
+        console.log(JSON.stringify({
+          event: 'oauth_unexpected_result',
+          platform: Platform.OS,
+          resultType: result.type,
+          timestamp: new Date().toISOString(),
+        }));
       }
     } catch (err) {
       console.error('[Login] Google sign-in error:', err);

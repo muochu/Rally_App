@@ -1,7 +1,7 @@
 /**
  * Auth Callback Handler for Supabase OAuth
  */
-import { supabase, SUPABASE_URL, SUPABASE_ANON_KEY } from './supabase';
+import { supabase, SUPABASE_ANON_KEY, SUPABASE_URL } from './supabase';
 
 export type AuthCallbackResult = {
   success: boolean;
@@ -45,6 +45,16 @@ function parseCallbackUrl(url: string): ParsedCallback {
 }
 
 export async function handleAuthCallback(url: string): Promise<AuthCallbackResult> {
+  // Structured logging (redact tokens)
+  const urlForLog = url.split('#')[0] + (url.includes('#') ? '#[REDACTED]' : '');
+  console.log(JSON.stringify({
+    event: 'auth_callback_received',
+    urlPrefix: urlForLog,
+    hasAccessToken: url.includes('access_token'),
+    hasRefreshToken: url.includes('refresh_token'),
+    timestamp: new Date().toISOString(),
+  }));
+
   if (!url.includes('auth/callback')) {
     return { success: false, error: 'Not an auth callback URL' };
   }
@@ -52,10 +62,22 @@ export async function handleAuthCallback(url: string): Promise<AuthCallbackResul
   const parsed = parseCallbackUrl(url);
 
   if (parsed.error) {
+    console.log(JSON.stringify({
+      event: 'auth_callback_error',
+      error: parsed.error,
+      errorDescription: parsed.errorDescription || null,
+      timestamp: new Date().toISOString(),
+    }));
     return { success: false, error: parsed.errorDescription || parsed.error };
   }
 
   if (!parsed.accessToken || !parsed.refreshToken) {
+    console.log(JSON.stringify({
+      event: 'auth_callback_missing_tokens',
+      hasAccessToken: !!parsed.accessToken,
+      hasRefreshToken: !!parsed.refreshToken,
+      timestamp: new Date().toISOString(),
+    }));
     return { success: false, error: 'Missing tokens in callback' };
   }
 
@@ -66,11 +88,21 @@ export async function handleAuthCallback(url: string): Promise<AuthCallbackResul
   });
 
   if (error || !data.session) {
-    console.error('[Auth] setSession failed:', error?.message);
+    console.log(JSON.stringify({
+      event: 'auth_set_session_failed',
+      error: error?.message || 'No session data',
+      timestamp: new Date().toISOString(),
+    }));
     return { success: false, error: error?.message || 'Failed to set session' };
   }
 
   const supabaseJwt = data.session.access_token;
+  
+  console.log(JSON.stringify({
+    event: 'auth_session_set',
+    userId: data.session.user?.id || null,
+    timestamp: new Date().toISOString(),
+  }));
 
   // Store Google provider tokens if present
   if (parsed.providerToken && parsed.providerRefreshToken) {

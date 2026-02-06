@@ -153,9 +153,9 @@ export default function FriendProfileScreen() {
   const handleInviteToPlay = async (slot: AvailabilityWindow) => {
     if (!user?.id || !friendId || !friend) return;
 
-    const key = `${slot.start_ts_utc}_${slot.end_ts_utc}`;
-    if (pendingProposals.has(key)) {
-      return; // Already has pending invite
+    // Check if slot already has a pending or accepted invite
+    if (pendingProposals.has(slot.id) || acceptedProposals.has(slot.id)) {
+      return; // Already has invite
     }
 
     // Show time picker modal
@@ -223,9 +223,8 @@ export default function FriendProfileScreen() {
                 startTime.toISOString(),
                 endTime.toISOString()
               );
-              // Update pending proposals map
-              const key = `${selectedSlot.start_ts_utc}_${selectedSlot.end_ts_utc}`;
-              setPendingProposals(prev => new Map(prev).set(key, true));
+              // Reload data to get the actual proposal and update the maps correctly
+              await loadData();
               Alert.alert('Invite Sent!', `${friend.display_name || 'Your friend'} will be notified.`);
             } catch (e: any) {
               const errorMessage = e?.message || e?.toString() || 'Unknown error';

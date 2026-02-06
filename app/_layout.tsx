@@ -26,13 +26,18 @@ function AuthGate({ children }: { children: React.ReactNode }) {
     // Allow invite route without auth - it handles its own auth state
     if (isInviteRoute) return;
 
-    if (!isAuthenticated && !inAuthGroup) {
-      // Redirect to login
-      router.replace('/(auth)/login');
-    } else if (isAuthenticated && inAuthGroup) {
-      // Redirect to main app
-      router.replace('/(tabs)');
-    }
+    // Defer navigation to next tick to ensure navigator is mounted
+    const timeoutId = setTimeout(() => {
+      if (!isAuthenticated && !inAuthGroup) {
+        // Redirect to login
+        router.replace('/(auth)/login');
+      } else if (isAuthenticated && inAuthGroup) {
+        // Redirect to main app
+        router.replace('/(tabs)');
+      }
+    }, 0);
+
+    return () => clearTimeout(timeoutId);
   }, [isAuthenticated, loading, segments]);
 
   // Handle profile setup completion

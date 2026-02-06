@@ -7,8 +7,6 @@ import {
   TouchableOpacity,
   ScrollView,
   Dimensions,
-  PanResponder,
-  Animated,
 } from 'react-native';
 import { useColorScheme } from '@/hooks/use-color-scheme';
 import { Colors } from '@/constants/theme';
@@ -40,93 +38,35 @@ export function TimeDurationPickerModal({
   const isDark = colorScheme === 'dark';
 
   const [selectedHour, setSelectedHour] = useState(initialDate.getHours());
-  const [selectedMinute, setSelectedMinute] = useState(Math.floor(initialDate.getMinutes() / 15) * 15);
+  const [selectedMinute, setSelectedMinute] = useState(initialDate.getMinutes());
   const [selectedDuration, setSelectedDuration] = useState(initialDuration);
 
   const hourScrollRef = useRef<ScrollView>(null);
   const minuteScrollRef = useRef<ScrollView>(null);
   const durationScrollRef = useRef<ScrollView>(null);
 
-  // Generate hours (0-23)
   const hours = Array.from({ length: 24 }, (_, i) => i);
-  
-  // Generate minutes (0-59) - all 60 minutes for testing
   const minutes = Array.from({ length: 60 }, (_, i) => i);
-  
-  // Generate duration options (1, 30, 45, 60, 90, 120 minutes)
-  // 1 minute added for testing purposes
-  const durations = [1, 30, 45, 60, 90, 120];
-
-  // Animation for drawer swipe
-  const translateY = useRef(new Animated.Value(0)).current;
-  const panResponder = useRef(
-    PanResponder.create({
-      onStartShouldSetPanResponder: (evt) => {
-        // Only activate if touch is on the handle or title area (top 80px)
-        const { locationY } = evt.nativeEvent;
-        return locationY < 80;
-      },
-      onMoveShouldSetPanResponder: (_, gestureState) => {
-        // Only respond to downward swipes (not horizontal scrolling on pickers)
-        return gestureState.dy > 10 && Math.abs(gestureState.dy) > Math.abs(gestureState.dx);
-      },
-      onPanResponderMove: (_, gestureState) => {
-        if (gestureState.dy > 0) {
-          translateY.setValue(gestureState.dy);
-        }
-      },
-      onPanResponderRelease: (_, gestureState) => {
-        if (gestureState.dy > 100 || gestureState.vy > 0.5) {
-          // Swipe down to dismiss
-          Animated.timing(translateY, {
-            toValue: Dimensions.get('window').height,
-            duration: 200,
-            useNativeDriver: true,
-          }).start(() => {
-            onClose();
-            translateY.setValue(0);
-          });
-        } else {
-          // Snap back
-          Animated.spring(translateY, {
-            toValue: 0,
-            useNativeDriver: true,
-            tension: 100,
-            friction: 8,
-          }).start();
-        }
-      },
-    })
-  ).current;
+  const durations = [1, 3, 5, 30, 45, 60, 90, 120];
 
   useEffect(() => {
     if (visible) {
       const hour = initialDate.getHours();
-      const minute = initialDate.getMinutes(); // Use exact minute now
+      const minute = initialDate.getMinutes();
       const duration = initialDuration;
       
       setSelectedHour(hour);
       setSelectedMinute(minute);
       setSelectedDuration(duration);
       
-      // Reset animation
-      translateY.setValue(0);
-      
-      // Scroll to initial positions after a short delay
       setTimeout(() => {
         hourScrollRef.current?.scrollTo({ y: hour * ITEM_HEIGHT, animated: false });
-        const minuteIndex = minutes.indexOf(minute);
-        if (minuteIndex >= 0) {
-          minuteScrollRef.current?.scrollTo({ y: minuteIndex * ITEM_HEIGHT, animated: false });
-        }
+        minuteScrollRef.current?.scrollTo({ y: minute * ITEM_HEIGHT, animated: false });
         const durationIndex = durations.indexOf(duration);
         if (durationIndex >= 0) {
           durationScrollRef.current?.scrollTo({ y: durationIndex * ITEM_HEIGHT, animated: false });
         }
       }, 100);
-    } else {
-      // Reset animation when closing
-      translateY.setValue(0);
     }
   }, [visible, initialDate, initialDuration]);
 
@@ -140,7 +80,7 @@ export function TimeDurationPickerModal({
   const handleMinuteScroll = (event: any) => {
     const y = event.nativeEvent.contentOffset.y;
     const index = Math.round(y / ITEM_HEIGHT);
-    const minute = Math.max(0, Math.min(59, index)); // 0-59 minutes
+    const minute = Math.max(0, Math.min(59, index));
     setSelectedMinute(minute);
   };
 
@@ -155,7 +95,6 @@ export function TimeDurationPickerModal({
     const selectedDate = new Date(initialDate);
     selectedDate.setHours(selectedHour, selectedMinute, 0, 0);
     
-    // Validate against min/max time if provided
     if (minTime && selectedDate < minTime) {
       selectedDate.setTime(minTime.getTime());
     }
@@ -173,8 +112,6 @@ export function TimeDurationPickerModal({
     scrollRef: React.RefObject<ScrollView>,
     formatLabel: (value: number) => string
   ) => {
-    const selectedIndex = data.indexOf(selectedValue);
-    
     return (
       <View style={styles.pickerContainer}>
         <View style={styles.pickerOverlay} />
@@ -188,7 +125,6 @@ export function TimeDurationPickerModal({
           onMomentumScrollEnd={onScroll}
           onScrollEndDrag={onScroll}
         >
-          {/* Spacer items */}
           {Array.from({ length: VISIBLE_ITEMS / 2 }).map((_, i) => (
             <View key={`spacer-top-${i}`} style={styles.pickerItem} />
           ))}
@@ -210,7 +146,6 @@ export function TimeDurationPickerModal({
             </View>
           ))}
           
-          {/* Spacer items */}
           {Array.from({ length: VISIBLE_ITEMS / 2 }).map((_, i) => (
             <View key={`spacer-bottom-${i}`} style={styles.pickerItem} />
           ))}
@@ -227,89 +162,71 @@ export function TimeDurationPickerModal({
       animationType="slide"
       onRequestClose={onClose}
     >
-      <TouchableOpacity
-        style={styles.modalOverlay}
-        activeOpacity={1}
-        onPress={onClose}
-      >
+      <View style={styles.modalOverlay}>
+        <View style={styles.modalContentWrapper}>
+          <View style={[styles.modalContent, { backgroundColor: isDark ? '#1a1a1a' : '#fff' }]}>
+            <View style={styles.modalHandle} />
+            <Text style={[styles.modalTitle, { color: colors.text }]}>
+              Select Match Time & Duration
+            </Text>
+
+            <View style={styles.pickersRow}>
+              <View style={styles.pickerColumn}>
+                <Text style={[styles.pickerLabel, { color: colors.icon }]}>Hour</Text>
+                {renderPicker(
+                  hours,
+                  selectedHour,
+                  handleHourScroll,
+                  hourScrollRef,
+                  (h) => h.toString().padStart(2, '0')
+                )}
+              </View>
+
+              <View style={styles.pickerColumn}>
+                <Text style={[styles.pickerLabel, { color: colors.icon }]}>Minute</Text>
+                {renderPicker(
+                  minutes,
+                  selectedMinute,
+                  handleMinuteScroll,
+                  minuteScrollRef,
+                  (m) => m.toString().padStart(2, '0')
+                )}
+              </View>
+
+              <View style={styles.pickerColumn}>
+                <Text style={[styles.pickerLabel, { color: colors.icon }]}>Duration</Text>
+                {renderPicker(
+                  durations,
+                  selectedDuration,
+                  handleDurationScroll,
+                  durationScrollRef,
+                  (d) => `${d} min`
+                )}
+              </View>
+            </View>
+
+            <View style={styles.modalActions}>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.cancelButton, { backgroundColor: isDark ? '#2a2a2a' : '#f0f0f0' }]}
+                onPress={onClose}
+              >
+                <Text style={[styles.actionButtonText, { color: colors.text }]}>Cancel</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.actionButton, styles.confirmButton, { backgroundColor: colors.tint }]}
+                onPress={handleConfirm}
+              >
+                <Text style={[styles.actionButtonText, { color: '#fff' }]}>Confirm</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
+        </View>
         <TouchableOpacity
+          style={StyleSheet.absoluteFill}
           activeOpacity={1}
-          onPress={(e) => e.stopPropagation()}
-        >
-          <Animated.View
-            style={[
-              styles.modalContent,
-              { backgroundColor: isDark ? '#1a1a1a' : '#fff' },
-              {
-                transform: [{ translateY: translateY }],
-              },
-            ]}
-          >
-            <View 
-              style={styles.handleContainer}
-              {...panResponder.panHandlers}
-            >
-              <View style={styles.modalHandle} />
-              <Text style={[styles.modalTitle, { color: colors.text }]}>
-                Select Match Time & Duration
-              </Text>
-            </View>
-
-          <View style={styles.pickersRow}>
-            {/* Hour Picker */}
-            <View style={styles.pickerColumn}>
-              <Text style={[styles.pickerLabel, { color: colors.icon }]}>Hour</Text>
-              {renderPicker(
-                hours,
-                selectedHour,
-                handleHourScroll,
-                hourScrollRef,
-                (h) => h.toString().padStart(2, '0')
-              )}
-            </View>
-
-            {/* Minute Picker */}
-            <View style={styles.pickerColumn}>
-              <Text style={[styles.pickerLabel, { color: colors.icon }]}>Minute</Text>
-              {renderPicker(
-                minutes,
-                selectedMinute,
-                handleMinuteScroll,
-                minuteScrollRef,
-                (m) => m.toString().padStart(2, '0')
-              )}
-            </View>
-
-            {/* Duration Picker */}
-            <View style={styles.pickerColumn}>
-              <Text style={[styles.pickerLabel, { color: colors.icon }]}>Duration</Text>
-              {renderPicker(
-                durations,
-                selectedDuration,
-                handleDurationScroll,
-                durationScrollRef,
-                (d) => `${d} min`
-              )}
-            </View>
-          </View>
-
-          <View style={styles.modalActions}>
-            <TouchableOpacity
-              style={[styles.actionButton, styles.cancelButton, { backgroundColor: isDark ? '#2a2a2a' : '#f0f0f0' }]}
-              onPress={onClose}
-            >
-              <Text style={[styles.actionButtonText, { color: colors.text }]}>Cancel</Text>
-            </TouchableOpacity>
-            <TouchableOpacity
-              style={[styles.actionButton, styles.confirmButton, { backgroundColor: colors.tint }]}
-              onPress={handleConfirm}
-            >
-              <Text style={[styles.actionButtonText, { color: '#fff' }]}>Confirm</Text>
-            </TouchableOpacity>
-          </View>
-          </Animated.View>
-        </TouchableOpacity>
-      </TouchableOpacity>
+          onPress={onClose}
+        />
+      </View>
     </Modal>
   );
 }
@@ -320,6 +237,9 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(0, 0, 0, 0.5)',
     justifyContent: 'flex-end',
   },
+  modalContentWrapper: {
+    zIndex: 1,
+  },
   modalContent: {
     borderTopLeftRadius: 24,
     borderTopRightRadius: 24,
@@ -328,23 +248,19 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     maxHeight: Dimensions.get('window').height * 0.7,
   },
-  handleContainer: {
-    paddingVertical: 12,
-    paddingHorizontal: 20,
-  },
   modalHandle: {
     width: 40,
     height: 4,
     backgroundColor: '#ccc',
     borderRadius: 2,
     alignSelf: 'center',
-    marginBottom: 12,
+    marginBottom: 20,
   },
   modalTitle: {
     fontSize: 20,
     fontWeight: '700',
     textAlign: 'center',
-    marginBottom: 12,
+    marginBottom: 24,
   },
   pickersRow: {
     flexDirection: 'row',
